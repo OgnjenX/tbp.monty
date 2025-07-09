@@ -205,7 +205,15 @@ Add optional parameters to existing LearningModule methods for cross-agent aware
 3. **Reuse Existing Infrastructure**: All existing sensor modules, learning modules, policies work as-is
 4. **Gradual Migration**: Can implement incrementally
 5. **Easy Testing**: Each agent unit can be tested independently using existing tests
-6  **Flexibility**: Supports various agent configurations and coordination strategies
+6. **Flexibility**: Supports various agent configurations and coordination strategies
+
+## Impact of Not Doing This
+
+Without multi-agent infrastructure, Monty cannot:
+- Enable cross-modal coordination between different agent types (surface vs. distant)
+- Implement coordinated exploration where agents independently move while sharing information
+- Support scenarios where multiple agents perceive the same object location simultaneously
+- Advance toward real-world multi-agent sensorimotor scenarios like robotic hand + vision coordination
 
 # Prior art and references
 
@@ -213,6 +221,8 @@ Multi-agent systems have been extensively studied in robotics and AI:
 
 - **Multi-Robot Systems**: Coordination algorithms for robot swarms and multi-robot exploration
 - **Distributed Sensing**: Sensor networks with multiple independent sensing nodes
+- **Thousand Brains Theory**: Cortical columns as independent processing units that coordinate through voting
+- **Cross-Modal Sensing**: Research on combining tactile and visual sensing for object recognition
 
 The proposed approach draws inspiration from these fields while maintaining compatibility with Monty's existing architecture.
 
@@ -222,5 +232,16 @@ The proposed approach draws inspiration from these fields while maintaining comp
 2. How should we handle agent failures or disconnections?
 3. What coordination strategies should be built-in vs. configurable?
 4. Should we eventually migrate to the internal approach for performance?
+
+# Future possibilities
+
+This multi-agent infrastructure opens several exciting possibilities:
+
+1. **Dynamic Multi-Object Environments**: Agents can seamlessly switch between objects in complex scenes
+2. **Hierarchical Agent Coordination**: Higher-level agents coordinating multiple lower-level agents
+3. **Real-World Robotics**: Direct application to multi-robot systems and robotic hands with vision
+4. **Cross-Modal Learning**: Rich sensorimotor experiences combining tactile and visual modalities
+5. **Scalable Architectures**: Support for large numbers of agents in complex environments
+6. **Enhanced Voting**: More sophisticated cross-agent voting mechanisms for improved object recognition
 
 The compositional approach also allows for future migration to more integrated architectures if performance requirements demand it, while preserving the investment in multi-agent coordination algorithms.
