@@ -12,137 +12,170 @@ import logging
 import numpy as np
 from typing import Dict, List, Optional, Tuple, Union
 
-from scipy.optimize import linear_sum_assignment
-from scipy.spatial.distance import cdist
-from scipy.spatial.transform import Rotation
-
 from tbp.monty.frameworks.abstract_reasoning.abstract_reference_frames import (
-    AbstractReferenceFrame,
-    ABSTRACT_FRAME_REGISTRY,
+    LearnedAbstractReferenceFrame,
 )
 from tbp.monty.frameworks.abstract_reasoning.concept_embeddings import (
-    ConceptEmbedding,
-    CONCEPT_EMBEDDING_REGISTRY,
+    TemporalConceptEmbedding,
+    LocalConceptEmbeddingManager,
 )
 from tbp.monty.frameworks.models.graph_matching import GraphLM, GraphMemory
 from tbp.monty.frameworks.models.states import State, GoalState
-from tbp.monty.frameworks.utils.graph_matching_utils import (
-    get_scaled_evidences,
-    get_custom_distances,
-)
 
 
-class AbstractGraphMatcher:
-    """Specialized graph matching for abstract reasoning domains.
-    
-    This class provides methods for matching conceptual graphs in abstract reasoning
-    domains such as philosophy, mathematics, and physics.
+class BiologicallyPlausibleGraphMatcher:
+    """Biologically plausible graph matching for abstract reasoning domains.
+
+    Uses simple associative learning and temporal patterns instead of complex
+    mathematical optimization, aligning with TBT principles of cortical computation.
     """
-    
+
     def __init__(
         self,
-        reference_frame: Optional[Union[str, AbstractReferenceFrame]] = None,
-        concept_embedding: Optional[Union[str, ConceptEmbedding]] = None,
-        similarity_threshold: float = 0.7,
-        max_graph_distance: float = 10.0,
-        feature_weights: Optional[Dict[str, float]] = None,
+        concept_manager: LocalConceptEmbeddingManager,
+        reference_frame: LearnedAbstractReferenceFrame,
+        similarity_threshold: float = 0.5,
+        temporal_weight: float = 0.4,
+        spatial_weight: float = 0.3,
+        semantic_weight: float = 0.3,
     ):
-        """Initialize the abstract graph matcher.
-        
+        """Initialize the biologically plausible graph matcher.
+
         Args:
-            reference_frame: Reference frame ID or instance to use for matching
-            concept_embedding: Concept embedding ID or instance to use
-            similarity_threshold: Threshold for considering nodes similar
-            max_graph_distance: Maximum distance between graphs to consider a match
-            feature_weights: Weights for different features when calculating similarity
+            concept_manager: Local concept embedding manager
+            reference_frame: Learned reference frame for spatial relationships
+            similarity_threshold: Minimum similarity for concept matching
+            temporal_weight: Weight for temporal pattern matching
+            spatial_weight: Weight for spatial relationship matching
+            semantic_weight: Weight for semantic similarity matching
         """
-        # Set up reference frame
-        if reference_frame is None:
-            self.reference_frame = None
-        elif isinstance(reference_frame, str):
-            if reference_frame in ABSTRACT_FRAME_REGISTRY:
-                self.reference_frame = ABSTRACT_FRAME_REGISTRY[reference_frame]
-            else:
-                raise ValueError(f"Unknown reference frame: {reference_frame}")
-        else:
-            self.reference_frame = reference_frame
-            
-        # Set up concept embedding
-        if concept_embedding is None:
-            self.concept_embedding = None
-        elif isinstance(concept_embedding, str):
-            if concept_embedding in CONCEPT_EMBEDDING_REGISTRY:
-                self.concept_embedding = CONCEPT_EMBEDDING_REGISTRY[concept_embedding]
-            else:
-                raise ValueError(f"Unknown concept embedding: {concept_embedding}")
-        else:
-            self.concept_embedding = concept_embedding
-            
+        self.concept_manager = concept_manager
+        self.reference_frame = reference_frame
         self.similarity_threshold = similarity_threshold
-        self.max_graph_distance = max_graph_distance
-        self.feature_weights = feature_weights or {
-            "semantic_vector": 1.0,
-            "relational_structure": 0.8,
-            "contextual_relevance": 0.6,
-        }
+
+        # Biologically plausible weights (sum to 1.0)
+        total_weight = temporal_weight + spatial_weight + semantic_weight
+        self.temporal_weight = temporal_weight / total_weight
+        self.spatial_weight = spatial_weight / total_weight
+        self.semantic_weight = semantic_weight / total_weight
+
+        # Simple associative memory for graph patterns
+        self.graph_patterns = {}  # pattern_id -> pattern_info
+        self.pattern_activations = {}  # pattern_id -> activation_count
+        self.successful_matches = {}  # pattern_id -> success_count
         
     def match_graphs(
-        self, 
-        source_graph: Dict, 
+        self,
+        source_graph: Dict,
         target_graph: Dict,
-        transform_reference_frame: bool = True,
+        temporal_context: Optional[List[str]] = None,
     ) -> Tuple[float, Dict]:
-        """Match two abstract concept graphs and return similarity score.
-        
+        """Match two abstract concept graphs using biologically plausible methods.
+
         Args:
             source_graph: Source graph to match from
             target_graph: Target graph to match to
-            transform_reference_frame: Whether to transform graphs to same reference frame
-            
+            temporal_context: Recent temporal context for matching
+
         Returns:
             Tuple of (similarity_score, node_mapping)
         """
-        # Transform graphs to same reference frame if needed
-        if transform_reference_frame and self.reference_frame is not None:
-            source_graph = self.reference_frame.transform_graph(source_graph)
-            target_graph = self.reference_frame.transform_graph(target_graph)
-            
-        # Extract nodes and edges from graphs
         source_nodes = source_graph.get("nodes", [])
-        source_edges = source_graph.get("edges", [])
         target_nodes = target_graph.get("nodes", [])
-        target_edges = target_graph.get("edges", [])
-        
+
         if not source_nodes or not target_nodes:
             return 0.0, {}
-            
-        # Calculate node similarity matrix
-        similarity_matrix = self._calculate_node_similarity_matrix(source_nodes, target_nodes)
-        
-        # Use Hungarian algorithm to find optimal node matching
-        row_ind, col_ind = linear_sum_assignment(-similarity_matrix)
-        
-        # Calculate overall similarity score
-        node_similarity = similarity_matrix[row_ind, col_ind].mean()
-        
-        # Calculate edge structure similarity if edges exist
-        if source_edges and target_edges:
-            edge_similarity = self._calculate_edge_similarity(
-                source_edges, target_edges, dict(zip(row_ind, col_ind))
-            )
-        else:
-            edge_similarity = 1.0 if not source_edges and not target_edges else 0.0
-            
-        # Combine node and edge similarity
-        overall_similarity = 0.7 * node_similarity + 0.3 * edge_similarity
-        
-        # Create node mapping dictionary
-        node_mapping = {source_nodes[i]["id"]: target_nodes[j]["id"] 
-                       for i, j in zip(row_ind, col_ind) 
-                       if similarity_matrix[i, j] >= self.similarity_threshold}
-        
+
+        # Simple associative matching instead of Hungarian algorithm
+        node_mapping = {}
+        total_similarity = 0.0
+
+        for i, source_node in enumerate(source_nodes):
+            best_match_idx = -1
+            best_similarity = 0.0
+
+            for j, target_node in enumerate(target_nodes):
+                if j in node_mapping.values():
+                    continue  # Already matched
+
+                # Calculate simple similarity
+                similarity = self._calculate_simple_node_similarity(
+                    source_node, target_node, temporal_context
+                )
+
+                if similarity > best_similarity and similarity >= self.similarity_threshold:
+                    best_similarity = similarity
+                    best_match_idx = j
+
+            if best_match_idx >= 0:
+                node_mapping[i] = best_match_idx
+                total_similarity += best_similarity
+
+        # Normalize by number of source nodes
+        overall_similarity = total_similarity / len(source_nodes) if source_nodes else 0.0
+
         return overall_similarity, node_mapping
-    
+
+    def _calculate_simple_node_similarity(
+        self,
+        node1: Dict,
+        node2: Dict,
+        temporal_context: Optional[List[str]] = None
+    ) -> float:
+        """Calculate simple biologically plausible node similarity.
+
+        Args:
+            node1: First node
+            node2: Second node
+            temporal_context: Recent temporal context
+
+        Returns:
+            Similarity score between 0 and 1
+        """
+        # Get concept IDs
+        concept1 = node1.get("concept_id", node1.get("id", ""))
+        concept2 = node2.get("concept_id", node2.get("id", ""))
+
+        if not concept1 or not concept2:
+            return 0.0
+
+        # Get embeddings from local manager
+        embedding1 = self.concept_manager.get_embedding(concept1)
+        embedding2 = self.concept_manager.get_embedding(concept2)
+
+        if embedding1 is None or embedding2 is None:
+            # Fall back to string similarity
+            return 1.0 if concept1 == concept2 else 0.0
+
+        # Calculate semantic similarity
+        semantic_sim = embedding1.similarity(embedding2)
+
+        # Calculate spatial similarity if positions available
+        spatial_sim = 0.0
+        pos1 = self.reference_frame.get_concept_position(concept1)
+        pos2 = self.reference_frame.get_concept_position(concept2)
+
+        if pos1 is not None and pos2 is not None:
+            distance = np.linalg.norm(pos1 - pos2)
+            spatial_sim = max(0.0, 1.0 - distance / 5.0)  # Normalize by max distance
+
+        # Calculate temporal similarity
+        temporal_sim = 0.0
+        if temporal_context:
+            # Check if concepts appear in similar temporal contexts
+            context1_score = 1.0 if concept1 in temporal_context else 0.0
+            context2_score = 1.0 if concept2 in temporal_context else 0.0
+            temporal_sim = min(context1_score, context2_score)
+
+        # Weighted combination
+        total_similarity = (
+            self.semantic_weight * semantic_sim +
+            self.spatial_weight * spatial_sim +
+            self.temporal_weight * temporal_sim
+        )
+
+        return total_similarity
+
     def find_subgraph_matches(
         self, 
         query_graph: Dict, 

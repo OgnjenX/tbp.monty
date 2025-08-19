@@ -1,69 +1,107 @@
 import copy
 import logging
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Tuple
+from collections import deque
 
 import numpy as np
 
 from tbp.monty.frameworks.abstract_reasoning.abstract_reference_frames import (
-    AbstractReferenceFrame,
-    ABSTRACT_FRAME_REGISTRY,
+    LearnedAbstractReferenceFrame,
 )
 from tbp.monty.frameworks.abstract_reasoning.concept_embeddings import (
-    ConceptEmbedding,
-    CONCEPT_EMBEDDING_REGISTRY,
+    TemporalConceptEmbedding,
+    LocalConceptEmbeddingManager,
+)
+from tbp.monty.frameworks.abstract_reasoning.abstract_motor_system import (
+    AbstractMotorAction,
+    AbstractMotorSystem,
+    AbstractMotorPolicy,
 )
 from tbp.monty.frameworks.models.evidence_matching import EvidenceGraphLM
 from tbp.monty.frameworks.models.states import State, GoalState
 from tbp.monty.frameworks.utils.spatial_arithmetics import align_orthonormal_vectors
 
 
-class AbstractReasoningLM(EvidenceGraphLM):
-    """Learning module for abstract reasoning domains.
-    
-    Extends EvidenceGraphLM with capabilities for handling abstract concepts
-    and reference frames.
+class SensorimotorAbstractReasoningLM(EvidenceGraphLM):
+    """Sensorimotor learning module for abstract reasoning domains.
+
+    Implements TBT principles for abstract reasoning through sensorimotor learning,
+    temporal sequence processing, and learned reference frames.
     """
 
     def __init__(
             self,
             lm_id: str,
             reasoning_domain: str,
-            primary_reference_frame: str,
-            domain_inference_rules: Optional[Dict] = None,
+            temporal_window: int = 15,
+            embedding_dim: int = 50,
+            motor_system: Optional[AbstractMotorSystem] = None,
             **kwargs,
     ):
-        """Initialize the abstract reasoning learning module.
-        
+        """Initialize a sensorimotor abstract reasoning learning module.
+
         Args:
             lm_id: Unique identifier for this learning module
-            reasoning_domain: Abstract domain this module handles
-            primary_reference_frame: Default reference frame ID to use
-            domain_inference_rules: Domain-specific inference rules
+            reasoning_domain: Domain of abstract reasoning
+            temporal_window: Size of temporal sequence buffer
+            embedding_dim: Dimensionality of concept embeddings
+            motor_system: Motor system for abstract actions
             **kwargs: Additional arguments for EvidenceGraphLM
         """
         super().__init__(lm_id=lm_id, **kwargs)
-
-        self.lm_id = None
+        self.lm_id = lm_id
         self.reasoning_domain = reasoning_domain
-        self.primary_reference_frame_id = primary_reference_frame
-        self.inference_rules = domain_inference_rules or {}
+        self.temporal_window = temporal_window
+        self.embedding_dim = embedding_dim
 
-        # Get the primary reference frame
-        try:
-            self.primary_reference_frame = ABSTRACT_FRAME_REGISTRY.get_frame(
-                reasoning_domain, primary_reference_frame
-            )
-        except KeyError:
-            logging.error(
-                f"Primary reference frame {primary_reference_frame} not found "
-                f"for domain {reasoning_domain}. Abstract reasoning module may not function correctly."
-            )
-            self.primary_reference_frame = None
+        # Local components - no global dependencies
+        self.concept_manager = LocalConceptEmbeddingManager(
+            module_id=lm_id,
+            embedding_dim=embedding_dim,
+            temporal_window=temporal_window
+        )
 
-        # Track concepts seen in this session
-        self.observed_concepts = {}  # concept_id -> ConceptEmbedding
+        self.reference_frame = LearnedAbstractReferenceFrame(
+            frame_id=f"{lm_id}_learned_frame",
+            domain=reasoning_domain,
+            max_dimensions=min(10, embedding_dim)
+        )
 
-    def _extract_concept_from_state(self, state: State) -> Optional[ConceptEmbedding]:
+        # Motor system for abstract exploration
+        self.motor_system = motor_system or self._create_default_motor_system()
+
+        # Temporal processing components
+        self.state_sequence = deque(maxlen=temporal_window)
+        self.concept_sequence = deque(maxlen=temporal_window)
+        self.motor_sequence = deque(maxlen=temporal_window)
+        self.evidence_sequence = deque(maxlen=temporal_window)
+
+        # Sensorimotor learning state
+        self.current_concept = None
+        self.current_position = np.zeros(3)
+        self.last_motor_action = None
+        self.exploration_goal = None
+
+        # Learning statistics
+        self.step_count = 0
+        self.successful_transitions = 0
+        self.total_transitions = 0
+
+    def _create_default_motor_system(self) -> AbstractMotorSystem:
+        """Create default motor system for abstract exploration."""
+        motor_system = AbstractMotorSystem(f"{self.lm_id}_motor_system")
+
+        # Add default exploration policy
+        policy = AbstractMotorPolicy(
+            policy_id=f"{self.lm_id}_exploration_policy",
+            exploration_probability=0.4,
+            step_size_range=(0.05, 0.15)
+        )
+        motor_system.add_policy(policy)
+
+        return motor_system
+
+    def _extract_concept_from_state(self, state: State) -> Optional[TemporalConceptEmbedding]:
         """Extract concept information from a State object.
         
         Args:
@@ -75,29 +113,26 @@ class AbstractReasoningLM(EvidenceGraphLM):
         if not state.use_state:
             return None
 
-        if state.sender_type != "ASM":
-            # Not from an abstract sensor module
+        # Accept both ASM (old) and SASM (new sensorimotor) sensor modules
+        if state.sender_type not in ["ASM", "SASM"]:
             return None
 
         # Extract concept information from non-morphological features
         non_morph = state.non_morphological_features
 
-        if "concept_id" not in non_morph or "domain" not in non_morph:
+        if "concept_id" not in non_morph:
             return None
 
         concept_id = non_morph["concept_id"]
-        domain = non_morph["domain"]
+        domain = non_morph.get("domain", self.reasoning_domain)
+        temporal_context = non_morph.get("temporal_context", [])
 
-        # Check if we've already seen this concept
-        if concept_id in self.observed_concepts:
-            return self.observed_concepts[concept_id]
-
-        # Get the concept from the registry
-        concept = CONCEPT_EMBEDDING_REGISTRY.get_embedding(domain, concept_id)
-
-        if concept is not None:
-            # Store for future reference
-            self.observed_concepts[concept_id] = concept
+        # Get or create concept using local manager (no global registry)
+        concept = self.concept_manager.get_or_create_embedding(
+            concept_id=concept_id,
+            domain=domain,
+            temporal_context=temporal_context
+        )
 
         return concept
 
@@ -281,46 +316,142 @@ class AbstractReasoningLM(EvidenceGraphLM):
         return enriched_result
 
     def exploratory_step(self, inputs: Dict[str, State]) -> Dict:
-        """Explore abstract concept space based on inputs.
-        
+        """Perform sensorimotor exploratory step in abstract space.
+
         Args:
             inputs: Dictionary mapping input keys to States
-            
+
         Returns:
             Dictionary of outputs from exploration process
         """
-        # Transform all inputs to primary reference frame if needed
-        transformed_inputs = {}
+        self.step_count += 1
+
+        # Process inputs and extract concepts
+        current_concepts = []
+        processed_inputs = {}
+
         for key, state in inputs.items():
+            processed_inputs[key] = state
+
             if not state.use_state:
-                transformed_inputs[key] = state
                 continue
 
-            # Extract the source reference frame
-            source_frame = self._extract_reference_frame_from_state(state)
-
-            if source_frame is None or source_frame.frame_id == self.primary_reference_frame_id:
-                # Already in the right frame or no frame information
-                transformed_inputs[key] = state
-            else:
-                # Transform to primary reference frame
-                transformed_inputs[key] = self._transform_state_reference_frame(
-                    state, source_frame, self.primary_reference_frame
-                )
-
-        # Extract concepts from inputs
-        for key, state in transformed_inputs.items():
             concept = self._extract_concept_from_state(state)
             if concept is not None:
-                # Store concept for future reference
-                self.observed_concepts[concept.concept_id] = concept
+                current_concepts.append(concept)
 
-        # Call the parent's exploratory implementation
-        return super().exploratory_step(transformed_inputs)
+                # Update sequences
+                self.state_sequence.append(state)
+                self.concept_sequence.append(concept.concept_id)
+
+        if not current_concepts:
+            # No concepts extracted, perform random exploration
+            self._perform_random_exploration()
+            return super().exploratory_step(processed_inputs)
+
+        # Use most salient concept as current
+        primary_concept = current_concepts[0]
+        self.current_concept = primary_concept.concept_id
+
+        # Generate motor action for exploration
+        motor_action = self._generate_exploration_action(primary_concept)
+
+        # Update position and learn sensorimotor associations
+        if motor_action is not None:
+            self._execute_motor_action(motor_action)
+            self._learn_sensorimotor_association(primary_concept, motor_action)
+
+        # Call parent's exploratory implementation
+        return super().exploratory_step(processed_inputs)
+
+    def _perform_random_exploration(self) -> None:
+        """Perform random exploration when no concepts are available."""
+        if self.motor_system:
+            # Generate random exploration action
+            random_action = self.motor_system.propose_action(
+                current_concept="unknown",
+                current_position=self.current_position
+            )
+            if random_action:
+                self._execute_motor_action(random_action)
+
+    def _generate_exploration_action(self, concept: TemporalConceptEmbedding) -> Optional[AbstractMotorAction]:
+        """Generate motor action for exploring around a concept."""
+        if not self.motor_system:
+            return None
+
+        # Get current position in reference frame
+        concept_position = self.reference_frame.get_concept_position(concept.concept_id)
+        if concept_position is None:
+            concept_position = self.current_position
+
+        # Get nearby concepts for context
+        nearby_concepts = self.reference_frame.get_nearby_concepts(concept.concept_id)
+
+        return self.motor_system.propose_action(
+            current_concept=concept.concept_id,
+            current_position=concept_position,
+            nearby_concepts=nearby_concepts
+        )
+
+    def _execute_motor_action(self, motor_action: AbstractMotorAction) -> None:
+        """Execute a motor action and update position."""
+        self.current_position += motor_action.displacement
+        self.motor_sequence.append(motor_action)
+        self.last_motor_action = motor_action
+
+    def _learn_sensorimotor_association(
+        self,
+        concept: TemporalConceptEmbedding,
+        motor_action: AbstractMotorAction
+    ) -> None:
+        """Learn association between concepts and motor actions."""
+        if len(self.concept_sequence) < 2:
+            return
+
+        # Get previous concept
+        prev_concept_id = self.concept_sequence[-2]
+        current_concept_id = concept.concept_id
+
+        # Add experience to reference frame
+        temporal_context = list(self.concept_sequence)[-5:]  # Last 5 concepts
+        self.reference_frame.add_sensorimotor_experience(
+            source_concept=prev_concept_id,
+            target_concept=current_concept_id,
+            motor_action=motor_action.displacement,
+            temporal_context=temporal_context
+        )
+
+        # Update motor system with success/failure
+        success = self._evaluate_transition_success(prev_concept_id, current_concept_id)
+        self.motor_system.update_from_experience(
+            action=motor_action,
+            success=success,
+            source_concept=prev_concept_id,
+            target_concept=current_concept_id
+        )
+
+        # Update statistics
+        self.total_transitions += 1
+        if success:
+            self.successful_transitions += 1
+
+    def _evaluate_transition_success(self, source_concept: str, target_concept: str) -> bool:
+        """Evaluate whether a concept transition was successful."""
+        # Simple heuristic: success if we moved to a related concept
+        source_embedding = self.concept_manager.get_embedding(source_concept)
+        target_embedding = self.concept_manager.get_embedding(target_concept)
+
+        if source_embedding is None or target_embedding is None:
+            return False
+
+        # Consider transition successful if concepts are moderately similar
+        similarity = source_embedding.similarity(target_embedding)
+        return 0.3 <= similarity <= 0.8  # Not too similar, not too different
 
     def propose_goal_state(self) -> Optional[GoalState]:
-        """Propose a goal state based on abstract reasoning.
-        
+        """Propose a goal state based on sensorimotor abstract reasoning.
+
         Returns:
             Goal state or None if no goal state is proposed
         """
@@ -330,238 +461,287 @@ class AbstractReasoningLM(EvidenceGraphLM):
         if mlh is None or "object_id" not in mlh:
             return None
 
-        # Create a goal state
+        # Predict next concept based on temporal patterns
+        next_concept = None
+        if self.current_concept:
+            prediction = self.concept_manager.predict_next_concept(
+                self.current_concept,
+                self.reasoning_domain
+            )
+            if prediction:
+                next_concept = prediction[0]
+
+        # Get target position in learned reference frame
+        target_position = None
+        if next_concept:
+            target_position = self.reference_frame.get_concept_position(next_concept)
+
+        # Create goal state with sensorimotor information
         goal_state = GoalState(
-            location=None,  # Abstract goal states often don't have physical locations
-            morphological_features=None,
+            location=target_position[:3] if target_position is not None else self.current_position,
+            morphological_features={
+                "pose_vectors": np.eye(3),
+                "pose_fully_defined": self.reference_frame.is_stable,
+                "reference_frame_stability": self.reference_frame.stability_score,
+            },
             non_morphological_features={
                 "concept_id": mlh["object_id"],
                 "domain": self.reasoning_domain,
-                "abstract_goal": True,
-                "reference_frame_id": self.primary_reference_frame_id,
+                "target_concept": next_concept,
+                "current_concept": self.current_concept,
+                "temporal_context": list(self.concept_sequence)[-3:],
+                "motor_exploration": True,
+                "reference_frame_id": self.reference_frame.frame_id,
             },
-            confidence=mlh.get("evidence", 0.0),
+            confidence=mlh.get("evidence", 0.0) * self.reference_frame.stability_score,
             use_state=True,
             sender_id=self.lm_id,
             sender_type="LM",
             goal_tolerances=None,
-            info={"abstract_reasoning": True},
+            info={
+                "sensorimotor_reasoning": True,
+                "step_count": self.step_count,
+                "successful_transitions": self.successful_transitions,
+                "total_transitions": self.total_transitions,
+            },
         )
 
         return goal_state
 
 
-class PhilosophicalReasoningLM(AbstractReasoningLM):
-    """Learning module specialized for philosophical reasoning."""
+class SensorimotorPhilosophicalReasoningLM(SensorimotorAbstractReasoningLM):
+    """Sensorimotor learning module specialized for philosophical reasoning."""
 
     def __init__(
             self,
             lm_id: str,
-            primary_reference_frame: str,
             philosophical_school: str = "general",
+            temporal_window: int = 15,
+            embedding_dim: int = 50,
             **kwargs,
     ):
-        """Initialize a philosophical reasoning module.
-        
+        """Initialize a sensorimotor philosophical reasoning module.
+
         Args:
             lm_id: Unique identifier for this learning module
-            primary_reference_frame: Default reference frame ID to use
             philosophical_school: Specific school of philosophy to use
-            **kwargs: Additional arguments for AbstractReasoningLM
+            temporal_window: Size of temporal sequence buffer
+            embedding_dim: Dimensionality of concept embeddings
+            **kwargs: Additional arguments for SensorimotorAbstractReasoningLM
         """
         super().__init__(
             lm_id=lm_id,
             reasoning_domain="philosophy",
-            primary_reference_frame=primary_reference_frame,
+            temporal_window=temporal_window,
+            embedding_dim=embedding_dim,
             **kwargs,
         )
 
         self.philosophical_school = philosophical_school
 
-        # School-specific inference rules
-        self.school_inference_rules = self._initialize_school_inference_rules()
+        # School-specific biases for concept similarity
+        self.school_concept_biases = self._initialize_school_biases()
 
-    def _initialize_school_inference_rules(self) -> Dict:
-        """Initialize school-specific inference rules.
-        
+    def _initialize_school_biases(self) -> Dict[str, float]:
+        """Initialize school-specific concept biases.
+
         Returns:
-            Dictionary of inference rules
+            Dictionary of concept biases for the philosophical school
         """
-        # These would be more complex in a real implementation
+        # Biologically plausible biases instead of complex inference rules
         if self.philosophical_school == "utilitarian":
             return {
-                "happiness": lambda x: x * 1.2,
-                "suffering": lambda x: x * -1.5,
+                "happiness": 1.2,
+                "pleasure": 1.1,
+                "suffering": -0.5,
+                "pain": -0.4,
+                "utility": 1.0,
             }
         elif self.philosophical_school == "kantian":
             return {
-                "duty": lambda x: x * 1.5,
-                "universality": lambda x: x * 1.3,
+                "duty": 1.3,
+                "categorical": 1.2,
+                "universal": 1.1,
+                "maxim": 1.0,
+                "autonomy": 1.1,
+            }
+        elif self.philosophical_school == "virtue_ethics":
+            return {
+                "virtue": 1.2,
+                "character": 1.1,
+                "excellence": 1.0,
+                "flourishing": 1.1,
+                "wisdom": 1.0,
             }
 
-        # Default general rules
+        # Default general biases
         return {}
 
-    def _apply_philosophical_inference_rules(self, matched_result: Dict) -> Dict:
-        """Apply philosophy-specific inference rules with school specialization.
-        
-        Args:
-            matched_result: Result from standard matching
-            
-        Returns:
-            Enhanced result with philosophical inferences
-        """
-        # Apply general philosophical inference rules
-        result = super()._apply_philosophical_inference_rules(matched_result)
+    def _evaluate_transition_success(self, source_concept: str, target_concept: str) -> bool:
+        """Evaluate transition success with philosophical school biases."""
+        # Get base success evaluation
+        base_success = super()._evaluate_transition_success(source_concept, target_concept)
 
-        # Apply school-specific rules
-        if "object_id" in result and result["object_id"] in self.school_inference_rules:
-            rule = self.school_inference_rules[result["object_id"]]
-            if "evidence" in result:
-                result["evidence"] = rule(result["evidence"])
+        # Apply school-specific biases
+        bias_factor = 1.0
+        for concept_key, bias in self.school_concept_biases.items():
+            if concept_key in target_concept.lower():
+                bias_factor *= bias
+                break
 
-        return result
+        # Adjust success probability based on bias
+        if bias_factor > 1.0:
+            return True  # Favor transitions to school-relevant concepts
+        elif bias_factor < 0:
+            return False  # Avoid negatively biased concepts
+
+        return base_success
 
 
-class MathematicalReasoningLM(AbstractReasoningLM):
-    """Learning module specialized for mathematical reasoning."""
+class SensorimotorMathematicalReasoningLM(SensorimotorAbstractReasoningLM):
+    """Sensorimotor learning module specialized for mathematical reasoning."""
 
     def __init__(
             self,
             lm_id: str,
-            primary_reference_frame: str,
             math_domain: str = "general",
+            temporal_window: int = 15,
+            embedding_dim: int = 50,
             **kwargs,
     ):
-        """Initialize a mathematical reasoning module.
-        
+        """Initialize a sensorimotor mathematical reasoning module.
+
         Args:
             lm_id: Unique identifier for this learning module
-            primary_reference_frame: Default reference frame ID to use
             math_domain: Specific branch of mathematics
-            **kwargs: Additional arguments for AbstractReasoningLM
+            temporal_window: Size of temporal sequence buffer
+            embedding_dim: Dimensionality of concept embeddings
+            **kwargs: Additional arguments for SensorimotorAbstractReasoningLM
         """
         super().__init__(
             lm_id=lm_id,
             reasoning_domain="mathematics",
-            primary_reference_frame=primary_reference_frame,
+            temporal_window=temporal_window,
+            embedding_dim=embedding_dim,
             **kwargs,
         )
 
         self.math_domain = math_domain
 
-        # Domain-specific mathematical structures
-        self.mathematical_structures = {}
+        # Domain-specific concept relationships
+        self.mathematical_concept_relationships = self._initialize_math_relationships()
 
-    def _apply_mathematical_inference_rules(self, matched_result: Dict) -> Dict:
-        """Apply mathematics-specific inference rules.
-        
-        Args:
-            matched_result: Result from standard matching
-            
-        Returns:
-            Enhanced result with mathematical inferences
-        """
-        # Apply general mathematical inference rules
-        result = super()._apply_mathematical_inference_rules(matched_result)
+    def _initialize_math_relationships(self) -> Dict[str, List[str]]:
+        """Initialize mathematical concept relationships for the domain."""
+        if self.math_domain == "geometry":
+            return {
+                "triangle": ["polygon", "shape", "three_sides", "angles"],
+                "circle": ["shape", "round", "radius", "diameter"],
+                "square": ["polygon", "rectangle", "four_sides", "equal_sides"],
+                "angle": ["measurement", "degrees", "radians"],
+            }
+        elif self.math_domain == "algebra":
+            return {
+                "equation": ["expression", "equality", "solve", "variable"],
+                "variable": ["unknown", "symbol", "x", "y"],
+                "polynomial": ["expression", "terms", "degree", "coefficient"],
+                "function": ["mapping", "input", "output", "domain"],
+            }
+        elif self.math_domain == "calculus":
+            return {
+                "derivative": ["rate", "change", "slope", "limit"],
+                "integral": ["area", "accumulation", "antiderivative"],
+                "limit": ["approach", "infinity", "continuous"],
+                "function": ["continuous", "differentiable", "domain"],
+            }
 
-        # Apply domain-specific rules
-        if self.math_domain == "geometry" and "object_id" in result:
-            # Example: Infer properties of geometric objects
-            if result["object_id"] == "triangle":
-                result["inferred_properties"] = {
-                    "angles_sum": 180,
-                    "sides": 3,
-                }
+        return {}
 
-        return result
+    def _evaluate_transition_success(self, source_concept: str, target_concept: str) -> bool:
+        """Evaluate transition success with mathematical domain knowledge."""
+        # Check if concepts are mathematically related
+        for concept, related_concepts in self.mathematical_concept_relationships.items():
+            if concept in source_concept.lower():
+                # If target is related to source, consider it successful
+                for related in related_concepts:
+                    if related in target_concept.lower():
+                        return True
+
+        # Fall back to base evaluation
+        return super()._evaluate_transition_success(source_concept, target_concept)
 
 
-class PhysicsReasoningLM(AbstractReasoningLM):
-    """Learning module specialized for physics reasoning."""
+class SensorimotorPhysicsReasoningLM(SensorimotorAbstractReasoningLM):
+    """Sensorimotor learning module specialized for physics reasoning."""
 
     def __init__(
             self,
             lm_id: str,
-            primary_reference_frame: str,
             physics_framework: str = "classical",
+            temporal_window: int = 15,
+            embedding_dim: int = 50,
             **kwargs,
     ):
-        """Initialize a physics reasoning module.
-        
+        """Initialize a sensorimotor physics reasoning module.
+
         Args:
             lm_id: Unique identifier for this learning module
-            primary_reference_frame: Default reference frame ID to use
             physics_framework: Theoretical framework (classical, quantum, relativistic)
-            **kwargs: Additional arguments for AbstractReasoningLM
+            temporal_window: Size of temporal sequence buffer
+            embedding_dim: Dimensionality of concept embeddings
+            **kwargs: Additional arguments for SensorimotorAbstractReasoningLM
         """
         super().__init__(
             lm_id=lm_id,
             reasoning_domain="physics",
-            primary_reference_frame=primary_reference_frame,
+            temporal_window=temporal_window,
+            embedding_dim=embedding_dim,
             **kwargs,
         )
 
         self.physics_framework = physics_framework
 
-        # Framework-specific constants and equations
-        self.physical_constants = self._initialize_physical_constants()
-        self.physical_equations = self._initialize_physical_equations()
+        # Framework-specific concept relationships
+        self.physics_concept_relationships = self._initialize_physics_relationships()
 
-    def _initialize_physical_constants(self) -> Dict:
-        """Initialize physical constants for the current framework.
-        
-        Returns:
-            Dictionary of physical constants
-        """
+    def _initialize_physics_relationships(self) -> Dict[str, List[str]]:
+        """Initialize physics concept relationships for the framework."""
         if self.physics_framework == "classical":
             return {
-                "G": 6.67430e-11,  # Gravitational constant
-                "c": 299792458,  # Speed of light
+                "force": ["mass", "acceleration", "newton", "motion"],
+                "mass": ["weight", "inertia", "matter", "kilogram"],
+                "velocity": ["speed", "direction", "motion", "time"],
+                "energy": ["work", "power", "kinetic", "potential"],
+                "gravity": ["force", "mass", "distance", "acceleration"],
+                "momentum": ["mass", "velocity", "conservation", "collision"],
             }
         elif self.physics_framework == "quantum":
             return {
-                "h": 6.62607015e-34,  # Planck constant
-                "ℏ": 1.0545718e-34,  # Reduced Planck constant
+                "photon": ["light", "particle", "wave", "energy"],
+                "electron": ["charge", "particle", "orbital", "spin"],
+                "wave": ["frequency", "amplitude", "interference", "particle"],
+                "energy": ["quantum", "discrete", "photon", "level"],
+                "uncertainty": ["position", "momentum", "measurement", "principle"],
             }
-
-        return {}
-
-    def _initialize_physical_equations(self) -> Dict:
-        """Initialize physical equations for the current framework.
-        
-        Returns:
-            Dictionary of physical equations
-        """
-        # Just placeholders - would be more complex in a real implementation
-        if self.physics_framework == "classical":
+        elif self.physics_framework == "relativistic":
             return {
-                "F = ma": lambda m, a: m * a,
-                "E = mc²": lambda m: m * self.physical_constants["c"] ** 2,
+                "spacetime": ["space", "time", "curvature", "gravity"],
+                "mass": ["energy", "equivalence", "rest", "relativistic"],
+                "light": ["speed", "constant", "photon", "spacetime"],
+                "gravity": ["curvature", "spacetime", "mass", "acceleration"],
             }
 
         return {}
 
-    def _apply_physics_inference_rules(self, matched_result: Dict) -> Dict:
-        """Apply physics-specific inference rules.
-        
-        Args:
-            matched_result: Result from standard matching
-            
-        Returns:
-            Enhanced result with physics inferences
-        """
-        # Apply general physics inference rules
-        result = super()._apply_physics_inference_rules(matched_result)
+    def _evaluate_transition_success(self, source_concept: str, target_concept: str) -> bool:
+        """Evaluate transition success with physics domain knowledge."""
+        # Check if concepts are physically related
+        for concept, related_concepts in self.physics_concept_relationships.items():
+            if concept in source_concept.lower():
+                # If target is related to source, consider it successful
+                for related in related_concepts:
+                    if related in target_concept.lower():
+                        return True
 
-        # Apply framework-specific rules
-        if "object_id" in result:
-            concept = result["object_id"]
-
-            # Example: If we detected "mass" and "distance", infer gravitational force
-            if concept == "mass" and "related_concepts" in result.get("non_morphological_features", {}):
-                related = result["non_morphological_features"]["related_concepts"]
-                if "distance" in related and self.physics_framework == "classical":
-                    result["inferred_concepts"] = ["gravitational_force"]
-
-        return result
+        # Fall back to base evaluation
+        return super()._evaluate_transition_success(source_concept, target_concept)
