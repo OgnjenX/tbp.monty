@@ -582,6 +582,74 @@ class EvidenceGraphLM(GraphLM):
         """
         return self.current_mlh
 
+    # ---------- CML helper methods (minimal, opt-in) ---------
+    def get_entropy(self) -> float:
+        """Compute entropy over per-object max evidences (normalized).
+
+        Returns 0 if evidences are unavailable or degenerate. This is a minimal helper
+        for meta-layer metrics and does not affect LM logic.
+        """
+        try:
+            graph_ids, evidences = self.get_evidence_for_each_graph()
+            evidences = np.asarray(evidences, dtype=float)
+            if evidences.size == 0 or np.all(evidences == 0):
+                return 0.0
+            p = evidences / (evidences.sum() + 1e-12)
+            # natural log entropy
+            ent = -np.sum(p * (np.log(p + 1e-12)))
+            return float(ent)
+        except Exception:
+            return 0.0
+
+    def get_mlh_slope(self, window: int = 10) -> float:
+        """Approximate recent slope of MLH evidence via EMA over buffer entries.
+
+        Uses stats stored in the LM buffer where available; falls back to 0.
+        """
+        try:
+            # Pull recent MLH evidence from buffer stats if present
+            series = []
+            stats = getattr(self.buffer, "stats", {})
+            cur_list = stats.get("current_mlh", [])
+            # cur_list is expected to be a list of dicts over steps
+            tail = cur_list[-max(window * 2, 2) :]
+            for cur in tail:
+                if isinstance(cur, dict) and ("evidence" in cur):
+                    series.append(cur["evidence"])
+            if len(series) < 2:
+                return 0.0
+            # simple finite difference on smoothed series
+            alpha = 2 / (window + 1)
+            ema = None
+            slopes = []
+            prev = None
+            for v in series:
+                ema = v if ema is None else (alpha * v + (1 - alpha) * ema)
+                if prev is not None:
+                    slopes.append(ema - prev)
+                prev = ema
+            if not slopes:
+                return 0.0
+            return float(np.mean(slopes[-window:]))
+        except Exception:
+            return 0.0
+
+    def set_temp_feature_weights(self, weights: dict, ttl_steps: int = 0) -> None:
+        """Temporarily override feature weights; optional TTL for external controllers.
+
+        The override is not automatically decayed; an external controller should manage
+        restoration using the returned backup via `get_feature_weights_backup`.
+        """
+        # Save backup once
+        if not hasattr(self, "_feature_weights_backup"):
+            self._feature_weights_backup = self.feature_weights.copy()
+        self.feature_weights = weights
+
+    def restore_feature_weights(self) -> None:
+        if hasattr(self, "_feature_weights_backup"):
+            self.feature_weights = self._feature_weights_backup
+            delattr(self, "_feature_weights_backup")
+
     def get_mlh_for_object(self, object_id):
         """Get mlh for a specific object ID.
 

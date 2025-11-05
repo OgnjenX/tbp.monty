@@ -79,6 +79,21 @@ class MontyForEvidenceGraphMatching(MontyForGraphMatching):
                             receiving_lm_pose[1:],
                             as_scipy=False,
                         )
+                        # Optional transform override via transform_manager
+                        if getattr(self, "transform_manager", None) is not None:
+                            try:
+                                sensor_disp, sensor_rotation_disp = (
+                                    self.transform_manager.pairwise_transform(
+                                        receiving_id=i,
+                                        sending_id=j,
+                                        receiving_pose=receiving_lm_pose,
+                                        sending_pose=sending_lm_pose,
+                                        sensor_disp=sensor_disp,
+                                        sensor_rotation=sensor_rotation_disp,
+                                    )
+                                )
+                            except Exception:
+                                pass
                         logger.debug(
                             f"LM {j} to {i} - displacement: {sensor_disp}, "
                             f"rotation: "
@@ -111,6 +126,18 @@ class MontyForEvidenceGraphMatching(MontyForGraphMatching):
                                     rotation=sensor_rotation_disp,
                                 )
                                 transformed_lm_states_for_object.append(new_s)
+                            if getattr(self, "transform_manager", None) is not None:
+                                try:
+                                    transformed_lm_states_for_object = (
+                                        self.transform_manager.postprocess_state_objects(
+                                            receiving_id=i,
+                                            sending_id=j,
+                                            object_id=obj,
+                                            states=transformed_lm_states_for_object,
+                                        )
+                                    )
+                                except Exception:
+                                    pass
                             if obj in lm_state_votes.keys():
                                 lm_state_votes[obj].extend(
                                     transformed_lm_states_for_object

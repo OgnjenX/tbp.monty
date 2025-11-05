@@ -87,6 +87,10 @@ class MontyBase(Monty):
         self.num_exploratory_steps = num_exploratory_steps
         self.max_total_steps = max_total_steps
 
+        # Optional creativity/perspective hooks (no-op by default)
+        self.before_vote_cb = None
+        self.after_step_cb = None
+
         # Counters, logging, default step_type
         self.step_type = "matching_step"
         self.is_seeking_match = True  # for consistency with custom monty experiments
@@ -315,7 +319,17 @@ class MontyBase(Monty):
                     )
 
     def _post_step(self):
-        pass
+        # Optional post-step callback for meta-layer logging/decisions
+        if getattr(self, "after_step_cb", None) is not None:
+            try:
+                step_metrics = dict(
+                    step_type=self.step_type,
+                    total_steps=self.total_steps,
+                    episode_steps=self.episode_steps,
+                )
+                self.after_step_cb(step_metrics)
+            except Exception:
+                pass
 
     ###
     # Methods (other than step) that interact with the experiment

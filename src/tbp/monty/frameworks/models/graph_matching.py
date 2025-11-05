@@ -50,6 +50,8 @@ class MontyForGraphMatching(MontyBase):
     def __init__(self, *args, **kwargs):
         """Initialize and reset LM."""
         super().__init__(*args, **kwargs)
+        # Optional transform manager for vote combination (identity by default)
+        self.transform_manager = None
 
     # =============== Public Interface Functions ===============
     # ------------------- Main Algorithm -----------------------
@@ -329,6 +331,23 @@ class MontyForGraphMatching(MontyBase):
                         sensor_rotation_disp, _ = Rotation.align_vectors(
                             sending_lm_pose[1:], receiving_lm_pose[1:]
                         )
+                        # Allow an optional transform manager to override/adjust the
+                        # pairwise transform used for remapping votes.
+                        if getattr(self, "transform_manager", None) is not None:
+                            try:
+                                sensor_disp, sensor_rotation_disp = (
+                                    self.transform_manager.pairwise_transform(
+                                        receiving_id=i,
+                                        sending_id=j,
+                                        receiving_pose=receiving_lm_pose,
+                                        sending_pose=sending_lm_pose,
+                                        sensor_disp=sensor_disp,
+                                        sensor_rotation=sensor_rotation_disp,
+                                    )
+                                )
+                            except Exception:
+                                # Fail-safe to identity behavior
+                                pass
                         logger.debug(
                             f"LM {i} to {j} - displacement: {sensor_disp}, "
                             f"rotation: "
@@ -367,10 +386,22 @@ class MontyForGraphMatching(MontyBase):
                                     lm_rot_vote_transformed
                                 )
                             else:
-                                lm_object_location_votes[obj] = np.array(
-                                    lm_loc_vote_transformed
-                                )
-                                lm_object_rotation_votes[obj] = lm_rot_vote_transformed
+                                locs = np.array(lm_loc_vote_transformed)
+                                rots = lm_rot_vote_transformed
+                                # Optional postprocess hook to adjust transformed votes
+                                if getattr(self, "transform_manager", None) is not None:
+                                    try:
+                                        locs, rots = self.transform_manager.postprocess_votes(
+                                            receiving_id=i,
+                                            sending_id=j,
+                                            object_id=obj,
+                                            locations=locs,
+                                            rotations=rots,
+                                        )
+                                    except Exception:
+                                        pass
+                                lm_object_location_votes[obj] = locs
+                                lm_object_rotation_votes[obj] = rots
                 logger.info(
                     f"VOTE from LMs {self.lm_to_lm_vote_matrix[i]} to LM {i}: + "
                     f"{pos_object_id_votes}, - {neg_object_id_votes}"
@@ -389,6 +420,12 @@ class MontyForGraphMatching(MontyBase):
         if self.lm_to_lm_vote_matrix is not None:
             # Send out votes
             votes_per_lm = []
+            # Optional pre-vote callback to allow meta-layer metric collection
+            if getattr(self, "before_vote_cb", None) is not None:
+                try:
+                    self.before_vote_cb(self.sensor_module_outputs, self.learning_module_outputs)
+                except Exception:
+                    pass
             for i in range(len(self.learning_modules)):
                 votes_per_lm.append(self.learning_modules[i].send_out_vote())
 
