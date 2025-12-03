@@ -141,6 +141,8 @@ class HabitatObservationProcessor:
         surface_normal_method=SurfaceNormalMethod.TLS,
         weight_curvature=True,
         is_surface_sm=False,
+        use_sdr_locations: bool = False,
+        sdr_encoder_config: dict | None = None,
     ) -> None:
         """Initializes the HabitatObservationProcessor.
 
@@ -157,12 +159,33 @@ class HabitatObservationProcessor:
             is_surface_sm: Surface SMs do not require that the central pixel is
                 "on object" in order to process the observation (i.e., extract
                 features). Defaults to False.
+            use_sdr_locations: If True, encode metric locations to SDR payloads.
+            sdr_encoder_config: Config dict for PlaceFieldEncoder when use_sdr_locations
+                is True. Keys: n_cells, sparsity, spatial_extent, n_dims, seed.
         """
         for feature in features:
             assert feature in self.POSSIBLE_FEATURES, (
                 f"{feature} not part of {self.POSSIBLE_FEATURES}"
             )
         self._features = features
+        self._is_surface_sm = is_surface_sm
+        self._pc1_is_pc2_threshold = pc1_is_pc2_threshold
+        self._sensor_module_id = sensor_module_id
+        self._surface_normal_method = surface_normal_method
+        self._weight_curvature = weight_curvature
+        self._use_sdr_locations = use_sdr_locations
+        self._sdr_encoder = None
+        if use_sdr_locations:
+            from tbp.monty.frameworks.utils.sdr import PlaceFieldEncoder
+
+            cfg = sdr_encoder_config or {}
+            self._sdr_encoder = PlaceFieldEncoder(
+                n_cells=cfg.get("n_cells", 4096),
+                sparsity=cfg.get("sparsity", 0.02),
+                spatial_extent=cfg.get("spatial_extent", 1.0),
+                n_dims=cfg.get("n_dims", 3),
+                seed=cfg.get("seed", 42),
+            )
         self._is_surface_sm = is_surface_sm
         self._pc1_is_pc2_threshold = pc1_is_pc2_threshold
         self._sensor_module_id = sensor_module_id
@@ -235,15 +258,36 @@ class HabitatObservationProcessor:
         # directions were valid; certain SMs and policies used separately can also set
         # it to False under appropriate conditions
 
-        observed_state = State(
-            location=np.array([x, y, z]),
-            morphological_features=morphological_features,
-            non_morphological_features=features,
-            confidence=1.0,
-            use_state=on_object and not invalid_signals,
-            sender_id=self._sensor_module_id,
-            sender_type="SM",
-        )
+        # Build location: either raw metric or SDR-encoded payload
+        metric_location = np.array([x, y, z])
+        if self._use_sdr_locations and self._sdr_encoder is not None:
+            sdr_value = self._sdr_encoder.encode(metric_location)
+            location_payload = {
+                "type": "sdr",
+                "value": sdr_value.active,
+                "n_bits": sdr_value.n_bits,
+                "frame_id": "world",
+                "metric_origin": metric_location,  # preserve original for decoding
+            }
+            observed_state = State(
+                location=location_payload,
+                morphological_features=morphological_features,
+                non_morphological_features=features,
+                confidence=1.0,
+                use_state=on_object and not invalid_signals,
+                sender_id=self._sensor_module_id,
+                sender_type="SM",
+            )
+        else:
+            observed_state = State(
+                location=metric_location,
+                morphological_features=morphological_features,
+                non_morphological_features=features,
+                confidence=1.0,
+                use_state=on_object and not invalid_signals,
+                sender_id=self._sensor_module_id,
+                sender_type="SM",
+            )
         # This is just for logging! Do not use _ attributes for matching
         observed_state._semantic_id = semantic_id
 

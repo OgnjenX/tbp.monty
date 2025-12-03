@@ -94,6 +94,7 @@ class FeatureGraphLM(GraphLM):
         self.possible_poses = {}
         self.last_unique_poses = None
         self.last_num_unique_locations = None
+        self._location_registry = None
 
     # =============== Public Interface Functions ===============
 
@@ -168,24 +169,29 @@ class FeatureGraphLM(GraphLM):
 
                 # Check that object is still in matches after ID update
                 if possible_obj in self.possible_matches:
-                    if vote_data["pos_location_votes"][possible_obj].shape[0] < (
-                        self.NUM_OTHER_LMS
-                    ):
-                        k = vote_data["pos_location_votes"][possible_obj].shape[0]
+                    raw_location_votes = vote_data["pos_location_votes"].get(
+                        possible_obj
+                    )
+                    if raw_location_votes is None:
+                        continue
+                    vote_locations = self._as_metric_array(raw_location_votes)
+                    if vote_locations.shape[0] == 0:
+                        continue
+                    if vote_locations.shape[0] < (self.NUM_OTHER_LMS):
+                        k = vote_locations.shape[0]
                         logger.info(f"only received {k} votes")
                     else:
                         # k should not be > num_lms - 1
-                        k = self.NUM_OTHER_LMS
-                    vote_location_tree = KDTree(
-                        vote_data["pos_location_votes"][possible_obj],
-                        leaf_size=2,
-                    )
+                        k = min(self.NUM_OTHER_LMS, vote_locations.shape[0])
+                    vote_location_tree = KDTree(vote_locations, leaf_size=2)
                     removed_locations = np.zeros((1, 3))
                     # print("updating possible locations on model")
                     for path_id, path in reversed(
                         list(enumerate(self.possible_paths[possible_obj]))
                     ):
-                        location = path[-1]
+                        location = self._coerce_single_location(path[-1])
+                        if location is None:
+                            continue
                         dists, _ = vote_location_tree.query([location], k=k)
                         # print(f"distances of nearest votes: {dists}")
                         # TODO: check pose vote as well.
@@ -246,7 +252,7 @@ class FeatureGraphLM(GraphLM):
                 "detected_path": detected_path,
                 "detected_location_on_model": current_model_loc,
                 "detected_location_rel_body": self.buffer.get_current_location(
-                    input_channel="first"
+                    input_channel="first", decode_to_metric=True
                 ),
                 "detected_rotation": r_euler[0],
                 "detected_rotation_quat": [rot.as_quat() for rot in r],
@@ -459,15 +465,19 @@ class FeatureGraphLM(GraphLM):
             features=features,
         )
 
+        feature_matched_locs = self._as_metric_array(feature_matched_locs)
+
         # if no points have the right features, it can't be this object
-        if len(feature_matched_node_ids) == 0:
+        if len(feature_matched_node_ids) == 0 or feature_matched_locs.shape[0] == 0:
             return [], []
 
         # create a new KDtree with only eligible nodes
         reduced_tree = KDTree(feature_matched_locs, leaf_size=2)
 
         for path_id, path in enumerate(self.possible_paths[graph_id]):
-            node_pos = path[-1]
+            node_pos = self._coerce_single_location(path[-1])
+            if node_pos is None:
+                continue
 
             for pose in self.possible_poses[graph_id][path_id]:
                 # This will just be one after the first step.
@@ -570,6 +580,80 @@ class FeatureGraphLM(GraphLM):
                 self._remove_object_from_matches(graph_id)
 
     # ------------------------ Helper --------------------------
+
+    def _get_location_registry(self):
+        if self._location_registry is None:
+            from tbp.monty.frameworks.utils.location_transforms import (
+                get_default_registry,
+            )
+
+            self._location_registry = get_default_registry()
+        return self._location_registry
+
+    def _coerce_single_location(self, location):
+        """Convert various location representations to a metric np.ndarray."""
+        if location is None:
+            return None
+        if isinstance(location, np.ndarray):
+            if location.dtype == object:
+                try:
+                    return location.astype(float)
+                except (ValueError, TypeError):
+                    return None
+            return location.astype(float, copy=False)
+        if isinstance(location, torch.Tensor):
+            return location.detach().cpu().numpy().astype(float)
+        if isinstance(location, (list, tuple)):
+            try:
+                return np.asarray(location, dtype=float)
+            except (ValueError, TypeError):
+                return None
+        if isinstance(location, dict):
+            loc_type = location.get("type")
+            if loc_type == "metric" and "value" in location:
+                return np.asarray(location["value"], dtype=float)
+            if "metric_origin" in location:
+                return np.asarray(location["metric_origin"], dtype=float)
+            if loc_type is not None:
+                registry = self._get_location_registry()
+                try:
+                    decoded = registry.apply(loc_type, "metric", location)
+                except KeyError:
+                    logger.debug(
+                        "No transform registered for %s -> metric; dropping location",
+                        loc_type,
+                    )
+                    return None
+                return np.asarray(decoded["value"], dtype=float)
+            return None
+        try:
+            return np.asarray(location, dtype=float)
+        except (ValueError, TypeError):
+            return None
+
+    def _as_metric_array(self, locations):
+        """Return an (N, 3) float array for KDTree operations."""
+        if locations is None:
+            return np.empty((0, 3))
+        if isinstance(locations, torch.Tensor):
+            return locations.detach().cpu().numpy().astype(float)
+        if isinstance(locations, np.ndarray) and locations.dtype != object:
+            return locations
+
+        if isinstance(locations, np.ndarray):
+            iterable = locations.tolist()
+        else:
+            iterable = locations
+
+        metric_rows = []
+        for loc in iterable:
+            coerced = self._coerce_single_location(loc)
+            if coerced is not None:
+                metric_rows.append(coerced)
+
+        if len(metric_rows) == 0:
+            return np.empty((0, 3))
+        return np.vstack(metric_rows)
 
     def _get_possible_recent_paths(self, object_id, n_back=4):
         """Return n_back steps of the current possible unique paths.

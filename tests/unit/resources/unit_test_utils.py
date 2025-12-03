@@ -553,7 +553,25 @@ class BaseGraphTest(TestCase):
                             # sm_id can not be compared as array
                             self.assertEqual(step_old[key3], step_new[key3])
                         else:
-                            np_old = np.array(step_old[key3])
-                            np_new = np.array(step_new[key3])
+                            np_old = np.array(
+                                self._extract_numeric_values(step_old[key3])
+                            )
+                            np_new = np.array(
+                                self._extract_numeric_values(step_new[key3])
+                            )
                             np_equal = np.isclose(np_old, np_new, atol=0.00001)
                             self.assertEqual(np.sum(np_equal), np_equal.size)
+
+    def _extract_numeric_values(self, value):
+        """Recursively convert payload dictionaries/lists into numeric data."""
+        if isinstance(value, dict):
+            if value.get("type") == "metric" and "value" in value:
+                return value["value"]
+            if "metric_origin" in value:
+                return value["metric_origin"]
+            return value
+        if isinstance(value, list):
+            return [self._extract_numeric_values(item) for item in value]
+        if isinstance(value, np.ndarray) and value.dtype == object:
+            return [self._extract_numeric_values(item) for item in value.tolist()]
+        return value

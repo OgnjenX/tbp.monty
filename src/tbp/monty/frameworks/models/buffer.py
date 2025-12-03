@@ -110,7 +110,7 @@ class FeatureAtLocationBuffer:
 
             self.channel_sender_types[input_channel] = state.sender_type
 
-            self._add_loc_to_location_buffer(input_channel, state.location)
+            self._add_loc_to_location_buffer(input_channel, state)
             if input_channel not in self.features.keys():
                 self.features[input_channel] = {}
             for attr in state.morphological_features.keys():
@@ -160,20 +160,38 @@ class FeatureAtLocationBuffer:
         """Reset the buffer."""
         self.__init__()
 
-    def get_current_location(self, input_channel):
+    def get_current_location(self, input_channel, decode_to_metric: bool = False):
         """Get the current location.
+
+        For metric locations returns the numpy array as before.
+        For SDR/other payloads returns the payload dict (or decodes if requested).
+
+        Args:
+            input_channel: Input channel identifier or "first".
+            decode_to_metric: If True and location is non-metric, attempt to
+                decode to metric coordinates using the transform registry.
 
         Note:
             May have to add on_object check at some point.
 
         Returns:
-            The current location.
+            The current location (numpy array for metric, dict for SDR/other).
         """
         if input_channel == "first":
             input_channel = self.get_first_sensory_input_channel()
 
         if len(self) > 0 and input_channel is not None:
-            return self.locations[input_channel][-1]
+            loc = self.locations[input_channel][-1]
+            if decode_to_metric and isinstance(loc, dict) and loc.get("type") != "metric":
+                # Decode non-metric payload to metric using transform registry
+                from tbp.monty.frameworks.utils.location_transforms import (
+                    get_default_registry,
+                )
+                registry = get_default_registry()
+                loc_type = loc.get("type")
+                decoded = registry.apply(loc_type, "metric", loc)
+                return decoded["value"]
+            return loc
 
         return None
 
@@ -232,18 +250,50 @@ class FeatureAtLocationBuffer:
             return self.on_object[-1]
         return False
 
-    def get_all_locations_on_object(self, input_channel=None):
+    def get_all_locations_on_object(self, input_channel=None, decode_to_metric=True):
         """Get all observed locations that were on the object.
 
+        Args:
+            input_channel: Input channel to get locations for. If None, return all.
+            decode_to_metric: If True (default), decode SDR payloads to metric coords
+                using the stored metric_origin. If False, return raw payloads.
+
         Returns:
-            All observed locations that were on the object.
+            All observed locations that were on the object as numpy array (metric)
+            or list of payloads if decode_to_metric=False.
         """
         if input_channel is None:
+            # Return entire dict; caller handles SDR payloads
             return self.locations
         if input_channel == "first":
             input_channel = self.get_first_sensory_input_channel()
         on_object_ids = np.where(self.features[input_channel]["on_object"])[0]
-        return np.array(self.locations[input_channel])[on_object_ids]
+
+        locs = self.locations.get(input_channel, np.empty((0, 3)))
+
+        # Check if locations are stored as SDR payloads (list) vs metric (numpy array)
+        if isinstance(locs, list):
+            # SDR payload list
+            selected_payloads = [locs[i] for i in on_object_ids if locs[i] is not None]
+            if not decode_to_metric:
+                return selected_payloads
+            # Decode to metric using stored metric_origin (if available)
+            metric_locs = []
+            for payload in selected_payloads:
+                if payload is None:
+                    continue
+                if payload.get("type") == "metric":
+                    metric_locs.append(payload.get("value"))
+                elif "metric_origin" in payload:
+                    # Use stored original metric location
+                    metric_locs.append(payload["metric_origin"])
+                else:
+                    # Cannot decode without origin; skip or raise
+                    pass
+            return np.array(metric_locs) if metric_locs else np.empty((0, 3))
+        else:
+            # Traditional numpy array storage
+            return np.array(locs)[on_object_ids]
 
     def get_all_input_states(self):
         """Get all the input states that the buffer's parent LM has observed.
@@ -502,22 +552,44 @@ class FeatureAtLocationBuffer:
             self.features[input_channel][attr_name] = padded_feat
         self.features[input_channel][attr_name][-1] = attr_value
 
-    def _add_loc_to_location_buffer(self, input_channel, location):
+    def _add_loc_to_location_buffer(self, input_channel, state):
         """Add location to location buffer.
+
+        Handles both legacy numeric locations and new location_payload dicts.
 
         Args:
             input_channel: Input channel from which the location was received.
-            location: Location to add to buffer.
+            state: State object containing location / location_payload.
         """
-        if input_channel not in self.locations.keys():
-            self.locations[input_channel] = np.empty((0, 0))
+        # Support both legacy and new State API
+        if hasattr(state, "location_payload") and state.location_payload is not None:
+            payload = state.location_payload
+            loc_type = payload.get("type", "metric")
+        else:
+            # Fallback for raw location passed (shouldn't happen in normal flow)
+            payload = {"type": "metric", "value": state.location, "frame_id": "body"}
+            loc_type = "metric"
 
-        padded_locs = self._fill_old_values_with_nans(
-            existing_vals=self.locations[input_channel],
-            new_val_len=location.shape[0],
-        )
-        self.locations[input_channel] = padded_locs
-        self.locations[input_channel][-1] = location
+        # For metric locations, store as before (numpy array).
+        # For SDR/other payloads, store the entire payload dict.
+        if loc_type == "metric":
+            location = payload.get("value")
+            if input_channel not in self.locations.keys():
+                self.locations[input_channel] = np.empty((0, 0))
+            padded_locs = self._fill_old_values_with_nans(
+                existing_vals=self.locations[input_channel],
+                new_val_len=location.shape[0],
+            )
+            self.locations[input_channel] = padded_locs
+            self.locations[input_channel][-1] = location
+        else:
+            # Non-metric: store payloads in a list (cannot be a dense numpy array)
+            if input_channel not in self.locations.keys():
+                self.locations[input_channel] = []
+            # Pad with None to keep indices aligned with step count
+            while len(self.locations[input_channel]) < len(self):
+                self.locations[input_channel].append(None)
+            self.locations[input_channel].append(payload)
 
     def _add_disp_to_displacement_buffer(self, input_channel, disp_name, disp_val):
         """Add displacement to displacement buffer.

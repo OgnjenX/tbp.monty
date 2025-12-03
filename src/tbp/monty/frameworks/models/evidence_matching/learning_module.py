@@ -551,7 +551,7 @@ class EvidenceGraphLM(GraphLM):
                     "detected_path": mlh["location"],
                     "detected_location_on_model": mlh["location"],
                     "detected_location_rel_body": self.buffer.get_current_location(
-                        input_channel="first"
+                        input_channel="first", decode_to_metric=True
                     ),
                     "detected_rotation": r_euler,
                     "detected_rotation_quat": r_inv.as_quat(),

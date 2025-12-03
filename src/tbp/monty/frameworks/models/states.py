@@ -53,6 +53,9 @@ class State:
         sender_type,
     ):
         """Initialize a state."""
+        # Preserve legacy `location` attribute for backward compatibility.
+        # Also normalize into a `location_payload` dict that supports multiple
+        # location types (metric vectors, SDRs, topo ids, etc.).
         self.location = location
         # QUESTION: Divide into pose_dependent and pose_independent features instead?
         self.morphological_features = morphological_features
@@ -64,6 +67,108 @@ class State:
         self._set_allowable_sender_types()
         if self.use_state:
             self._check_all_attributes()
+
+    # --- Location helpers -------------------------------------------------
+    def is_metric(self) -> bool:
+        """Return True if the stored location is a metric vector.
+
+        Legacy `location` numeric arrays are treated as metric by default.
+        """
+        return self.location_payload is not None and self.location_payload.get(
+            "type"
+        ) == "metric"
+
+    def is_sdr(self) -> bool:
+        """Return True if the stored location is an SDR."""
+        return self.location_payload is not None and self.location_payload.get(
+            "type"
+        ) == "sdr"
+
+    def location_dim(self) -> int | None:
+        """Return dimensionality of the location value when applicable.
+
+        Returns None for non-vector or unknown types.
+        """
+        val = self.location_payload.get("value")
+        if isinstance(val, np.ndarray):
+            return val.shape[0]
+        return None
+
+    def get_location_value(self):
+        """Return the underlying location value (payload 'value').
+
+        For legacy callers this mirrors `self.location` when the payload is
+        metric; for non-metric payloads it returns the payload value which may
+        be an SDR, id, or other structure.
+        """
+        return self.location_payload.get("value")
+
+    def get_location_type(self) -> str | None:
+        """Return the location payload type string (e.g., 'metric', 'sdr')."""
+        return self.location_payload.get("type") if self.location_payload else None
+
+    def get_frame_id(self) -> str | None:
+        """Return the reference frame id for the location."""
+        return self.location_payload.get("frame_id") if self.location_payload else None
+
+    def decode_to_metric(self, registry=None) -> np.ndarray:
+        """Decode location to metric coordinates.
+
+        If location is already metric, returns the value directly.
+        If location payload contains 'metric_origin', uses that directly.
+        Otherwise uses the provided (or default) registry to decode.
+
+        Args:
+            registry: Optional TransformRegistry. If None, uses default.
+
+        Returns:
+            Metric coordinates as numpy array.
+
+        Raises:
+            KeyError: If no transform is registered to decode the location type.
+        """
+        if self.is_metric():
+            return np.asarray(self.get_location_value())
+
+        # Check if payload contains metric_origin (e.g., SDR with preserved origin)
+        if self.location_payload and "metric_origin" in self.location_payload:
+            return np.asarray(self.location_payload["metric_origin"])
+
+        # Lazy import to avoid circular dependencies
+        from tbp.monty.frameworks.utils.location_transforms import get_default_registry
+
+        if registry is None:
+            registry = get_default_registry()
+        loc_type = self.get_location_type()
+        if loc_type is None:
+            raise ValueError("Cannot decode: location payload has no type")
+        decoded = registry.apply(loc_type, "metric", self.location_payload)
+        return np.asarray(decoded["value"])
+
+    def encode_to_sdr(self, registry=None) -> dict:
+        """Encode metric location to SDR using the transform registry.
+
+        If location is already SDR, returns the payload directly.
+        Otherwise uses the provided (or default) registry to encode.
+
+        Args:
+            registry: Optional TransformRegistry. If None, uses default.
+
+        Returns:
+            SDR location payload dict.
+
+        Raises:
+            KeyError: If no transform is registered for metric->sdr.
+        """
+        if self.is_sdr():
+            return self.location_payload.copy()
+        if not self.is_metric():
+            raise ValueError("Can only encode metric locations to SDR")
+        from tbp.monty.frameworks.utils.location_transforms import get_default_registry
+
+        if registry is None:
+            registry = get_default_registry()
+        return registry.apply("metric", "sdr", self.location_payload)
 
     def __repr__(self):
         """Return a string representation of the object."""
@@ -87,8 +192,11 @@ class State:
         if self.non_morphological_features is not None:
             for feature in self.non_morphological_features:
                 feat_val = self.non_morphological_features[feature]
-                if isinstance(feat_val, (np.ndarray, np.float64)):
+                # Round numpy arrays and numeric scalars for nicer repr output.
+                if isinstance(feat_val, np.ndarray):
                     feat_val = np.round(feat_val, 3)
+                elif isinstance(feat_val, (float, int, np.floating, np.integer)):
+                    feat_val = round(float(feat_val), 3)
                 repr_string += f"       {feature}: {feat_val}\n"
         repr_string += (
             f"   Confidence: {self.confidence}\n"
@@ -184,6 +292,10 @@ class State:
         )
         f"{self.morphological_features.keys()}"
         # TODO S: may want to test length and angle between vectors as well
+        # pose_vectors should still be a (3,3) array when present (surface
+        # normals and curvature directions are 3D quantities for sensor-based
+        # inputs). We keep this check but do not force the location to be
+        # numeric-3D unless the payload is metric.
         assert self.morphological_features["pose_vectors"].shape == (
             3,
             3,
@@ -194,9 +306,21 @@ class State:
             "pose_fully_defined must be a boolean but type is "
         )
         f"{type(self.morphological_features['pose_fully_defined'])}"
-        assert self.location.shape == (3,), (
-            f"Location must be a 3D vector but shape is {self.location.shape}"
-        )
+
+        # Only enforce 3D location shape when the location is metric (legacy
+        # numeric locations). This allows abstract LMs to attach SDRs or
+        # other non-metric payloads without failing this API-level check.
+        if self.is_metric():
+            loc_val = self.location_payload.get("value")
+            assert isinstance(loc_val, np.ndarray), (
+                "metric location must be a numpy array"
+            )
+            assert loc_val.shape == (
+                3,
+            ), f"Location must be a 3D vector but shape is {loc_val.shape}"
+        else:
+            # Non-metric locations are permitted; no assertion on shape.
+            pass
         assert self.confidence >= 0 and self.confidence <= 1, (
             f"Confidence must be in [0,1] but is {self.confidence}"
         )
@@ -209,6 +333,25 @@ class State:
         assert self.sender_type in self.allowable_sender_types, (
             f"sender_type must be SM or LM but is {self.sender_type}"
         )
+
+    # Keep location payload and legacy location attribute in sync -------------
+    @property
+    def location(self):
+        return getattr(self, "_location_raw", None)
+
+    @location.setter
+    def location(self, value):
+        self._location_raw = value
+        if isinstance(value, dict) and "type" in value:
+            # Already a payload dict; store directly so downstream code can access
+            self.location_payload = value
+        else:
+            # Treat legacy numeric inputs as metric coordinates in body frame
+            self.location_payload = {
+                "type": "metric",
+                "value": value,
+                "frame_id": "body",
+            }
 
 
 class GoalState(State):
@@ -310,9 +453,20 @@ class GoalState(State):
             )
             f"{type(self.morphological_features['pose_fully_defined'])}"
         if self.location is not None:
-            assert self.location.shape == (3,), (
-                f"Location must be a 3D vector but shape is {self.location.shape}"
-            )
+            # GoalState may receive legacy numeric locations or the normalized
+            # `location_payload`. If a metric payload is present, validate it is
+            # 3D. Otherwise, if a legacy numpy location is supplied, validate
+            # that instead.
+            loc_payload = getattr(self, "location_payload", None)
+            if loc_payload is not None and loc_payload.get("type") == "metric":
+                val = loc_payload.get("value")
+                assert isinstance(val, np.ndarray) and val.shape == (
+                    3,
+                ), f"Location must be a 3D vector but shape is {getattr(val, 'shape', None)}"
+            elif isinstance(self.location, np.ndarray):
+                assert self.location.shape == (
+                    3,
+                ), f"Location must be a 3D vector but shape is {self.location.shape}"
 
         assert self.confidence >= 0 and self.confidence <= 1, (
             f"Confidence must be in [0,1] but is {self.confidence}"

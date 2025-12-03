@@ -402,14 +402,15 @@ class DisplacementGraphLM(GraphLM):
         if len(self.buffer) > 0:
             # TODO S: Make sure result of get_current_location() and get_current_pose()
             # is on object (should always be atm).
-            displacement = np.array(
-                obs_to_use.location
-            ) - self.buffer.get_current_location(input_channel=obs_to_use.sender_id)
-
-            pos1 = torch.tensor(
-                self.buffer.get_current_location(input_channel=obs_to_use.sender_id)
+            # Handle SDR locations by decoding to metric for displacement calculation
+            obs_location = obs_to_use.get_location_value()  # Metric location
+            current_loc = self.buffer.get_current_location(
+                input_channel=obs_to_use.sender_id, decode_to_metric=True
             )
-            pos2 = torch.tensor(obs_to_use.location)
+            displacement = np.array(obs_location) - current_loc
+
+            pos1 = torch.tensor(current_loc)
+            pos2 = torch.tensor(obs_location)
             norm1 = torch.tensor(
                 # element 0 of current pose is location, element 1 is surface normal
                 self.buffer.get_current_pose(input_channel=obs_to_use.sender_id)[1],
