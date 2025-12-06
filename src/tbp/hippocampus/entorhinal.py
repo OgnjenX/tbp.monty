@@ -7,7 +7,7 @@ No dependencies on tbp.monty.
 from __future__ import annotations
 
 import logging
-from typing import Callable
+from typing import Callable, List, Tuple, Union, Dict
 
 import numpy as np
 
@@ -36,13 +36,14 @@ class EntorhinalCortex:
     """
 
     def __init__(
-        self,
-        memory: EpisodicMemory | None = None,
-        n_place_cells: int = 100,
-        n_grid_cells: int = 50,
-        place_cell_radius: float = 0.1,
-        grid_cell_spacings: list[float] | None = None,
-        spatial_extent: tuple[float, float, float] = (1.0, 1.0, 1.0),
+            self,
+            memory: Union[EpisodicMemory, None] = None,
+            n_place_cells: int = 100,
+            n_grid_cells: int = 50,
+            place_cell_radius: float = 0.1,
+            grid_cell_spacings: Union[List[float], None] = None,
+            spatial_extent: Tuple[float, float, float] = (1.0, 1.0, 1.0),
+            seed: Union[int, None] = None,
     ) -> None:
         """Initialize Entorhinal Cortex.
 
@@ -54,15 +55,17 @@ class EntorhinalCortex:
             grid_cell_spacings: List of grid spacings. If None, uses
                 default geometric series.
             spatial_extent: Extent of space for random place cell centers.
+            seed: Random seed for reproducibility. If None, uses current time.
         """
         self.memory = memory or EpisodicMemory()
-        self._listeners: list[Callable[[SpatialEvent], None]] = []
+        self._listeners: List[Callable[[SpatialEvent], None]] = []
         self._event_count = 0
+        self._rng = np.random.default_rng(seed)
 
         # Initialize place cells with random centers
-        self.place_cells: list[PlaceCell] = []
+        self.place_cells: List[PlaceCell] = []
         for i in range(n_place_cells):
-            center = np.random.uniform(
+            center = self._rng.uniform(
                 low=-np.array(spatial_extent) / 2,
                 high=np.array(spatial_extent) / 2,
             )
@@ -73,13 +76,13 @@ class EntorhinalCortex:
         # Initialize grid cells with varying spacings
         if grid_cell_spacings is None:
             # Default: geometric series of spacings
-            grid_cell_spacings = [0.1 * (1.4**i) for i in range(5)]
+            grid_cell_spacings = [0.1 * (1.4 ** i) for i in range(5)]
 
-        self.grid_cells: list[GridCell] = []
+        self.grid_cells: List[GridCell] = []
         for i in range(n_grid_cells):
             spacing = grid_cell_spacings[i % len(grid_cell_spacings)]
-            orientation = np.random.uniform(0, np.pi / 3)  # 0-60 degrees
-            phase = np.random.uniform(-spacing / 2, spacing / 2, size=2)
+            orientation = self._rng.uniform(0, np.pi / 3)
+            phase = self._rng.uniform(-spacing / 2, spacing / 2, size=2)
             self.grid_cells.append(
                 GridCell(
                     cell_id=i,
@@ -89,7 +92,7 @@ class EntorhinalCortex:
                 )
             )
 
-    def receive_event(self, event: SpatialEvent) -> dict[str, np.ndarray]:
+    def receive_event(self, event: SpatialEvent) -> Dict[str, np.ndarray]:
         """Process an incoming spatial event.
 
         This is the main entry point. When an event is received:
@@ -138,8 +141,8 @@ class EntorhinalCortex:
         }
 
     def receive_events(
-        self, events: list[SpatialEvent]
-    ) -> list[dict[str, np.ndarray]]:
+            self, events: List[SpatialEvent]
+    ) -> List[Dict[str, np.ndarray]]:
         """Process multiple events.
 
         Args:

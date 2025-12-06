@@ -48,12 +48,12 @@ Example:
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 
-from .basis import BasisCode, MetricGridBasis, MetricGridConfig, create_spatial_basis
+from .basis import BasisCode, create_spatial_basis
 from .ca1 import CA1, CA1Config
 from .ca3 import CA3, CA3Config
 from .dentate_gyrus import DentateGyrus, DGConfig
@@ -126,9 +126,9 @@ class Hippocampus:
     """
 
     def __init__(
-        self,
-        config: Optional[HippocampusConfig] = None,
-        basis: Optional[BasisCode] = None,
+            self,
+            config: Optional[HippocampusConfig] = None,
+            basis: Optional[BasisCode] = None,
     ) -> None:
         """Initialize Hippocampus system.
 
@@ -198,10 +198,10 @@ class Hippocampus:
     # ==================== State Access ====================
 
     def encode_event(
-        self,
-        event: SpatialEvent,
-        cortical_sdr: Optional[np.ndarray] = None,
-        context_tag: Optional[str] = None,
+            self,
+            event: SpatialEvent,
+            cortical_sdr: Optional[np.ndarray] = None,
+            context_tag: Optional[str] = None,
     ) -> HState:
         """Encode a spatial event into an HState.
 
@@ -278,9 +278,9 @@ class Hippocampus:
     # ==================== Relational Queries ====================
 
     def predict_next_hstates(
-        self,
-        n: int = 5,
-        from_hstate: Optional[Union[HState, str]] = None,
+            self,
+            n: int = 5,
+            from_hstate: Optional[Union[HState, str]] = None,
     ) -> List[HState]:
         """Predict next likely HStates from current or specified state.
 
@@ -301,10 +301,10 @@ class Hippocampus:
         return self.ca3.successors(from_hstate)[:n]
 
     def predict_future_hstates(
-        self,
-        steps: int = 5,
-        from_hstate: Optional[Union[HState, str]] = None,
-        stochastic: bool = False,
+            self,
+            steps: int = 5,
+            from_hstate: Optional[Union[HState, str]] = None,
+            stochastic: bool = False,
     ) -> List[HState]:
         """Predict future HStates over multiple steps.
 
@@ -326,9 +326,9 @@ class Hippocampus:
         return self.ca3.predict_future(from_hstate, n_steps=steps, stochastic=stochastic)
 
     def predict_cortical_future(
-        self,
-        steps: int = 3,
-        from_hstate: Optional[Union[HState, str]] = None,
+            self,
+            steps: int = 3,
+            from_hstate: Optional[Union[HState, str]] = None,
     ) -> List[np.ndarray]:
         """Predict future cortical SDR patterns.
 
@@ -352,8 +352,8 @@ class Hippocampus:
         return cortical_patterns
 
     def transition_probabilities(
-        self,
-        from_hstate: Optional[Union[HState, str]] = None,
+            self,
+            from_hstate: Optional[Union[HState, str]] = None,
     ) -> Dict[str, float]:
         """Get transition probabilities from current or specified state.
 
@@ -371,9 +371,9 @@ class Hippocampus:
         return self.ca3.transition_probability(from_hstate)
 
     def compute_sr(
-        self,
-        from_hstate: Optional[Union[HState, str]] = None,
-        n_steps: int = 10,
+            self,
+            from_hstate: Optional[Union[HState, str]] = None,
+            n_steps: int = 10,
     ) -> np.ndarray:
         """Compute Successor Representation vector.
 
@@ -428,8 +428,8 @@ class Hippocampus:
     # ==================== Retrieval & Pattern Completion ====================
 
     def retrieve_from_pattern(
-        self,
-        partial_pattern: np.ndarray,
+            self,
+            partial_pattern: np.ndarray,
     ) -> Optional[HState]:
         """Retrieve HState from partial pattern cue.
 
@@ -444,8 +444,8 @@ class Hippocampus:
         return self.ca3.retrieve_hstate(partial_pattern)
 
     def retrieve_from_cortical(
-        self,
-        cortical_sdr: np.ndarray,
+            self,
+            cortical_sdr: np.ndarray,
     ) -> Optional[HState]:
         """Retrieve HState from cortical SDR pattern.
 
@@ -465,9 +465,9 @@ class Hippocampus:
         return None
 
     def retrieve_from_location(
-        self,
-        location: np.ndarray,
-        threshold: float = 0.5,
+            self,
+            location: np.ndarray,
+            threshold: float = 0.5,
     ) -> List[HState]:
         """Retrieve HStates near a spatial location.
 
@@ -493,9 +493,9 @@ class Hippocampus:
     # ==================== Replay ====================
 
     def replay_forward(
-        self,
-        start_hstate: Optional[Union[HState, str]] = None,
-        depth: int = 5,
+            self,
+            start_hstate: Optional[Union[HState, str]] = None,
+            depth: int = 5,
     ) -> List[HState]:
         """Replay forward from current or specified state.
 
@@ -514,9 +514,9 @@ class Hippocampus:
         return self.ca3.replay_forward(start_hstate, depth)
 
     def replay_backward(
-        self,
-        end_hstate: Optional[Union[HState, str]] = None,
-        depth: int = 5,
+            self,
+            end_hstate: Optional[Union[HState, str]] = None,
+            depth: int = 5,
     ) -> List[HState]:
         """Replay backward to current or specified state.
 
@@ -535,10 +535,10 @@ class Hippocampus:
         return self.ca3.replay_backward(end_hstate, depth)
 
     def replay_recombine(
-        self,
-        hstate_a: Union[HState, str],
-        hstate_b: Union[HState, str],
-        max_path_length: int = 10,
+            self,
+            hstate_a: Union[HState, str],
+            hstate_b: Union[HState, str],
+            max_path_length: int = 10,
     ) -> List[List[HState]]:
         """Explore novel paths between two states (creativity).
 
@@ -562,10 +562,10 @@ class Hippocampus:
     # ==================== Comparison (CA1) ====================
 
     def compare(
-        self,
-        predicted_pattern: np.ndarray,
-        observed_pattern: np.ndarray,
-        event: SpatialEvent,
+            self,
+            predicted_pattern: np.ndarray,
+            observed_pattern: np.ndarray,
+            event: SpatialEvent,
     ):
         """Compare predicted and observed patterns via CA1.
 

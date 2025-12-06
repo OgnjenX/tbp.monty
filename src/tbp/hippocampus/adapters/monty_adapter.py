@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import TYPE_CHECKING, Any, Protocol, Sequence, runtime_checkable
+from typing import TYPE_CHECKING, Any, List, Protocol, Sequence, Union, runtime_checkable
 
 import numpy as np
 
@@ -30,11 +30,121 @@ class SupportsVoteAndOutput(Protocol):
 
     learning_module_id: str
 
-    def send_out_vote(self) -> dict | None:
+    def send_out_vote(self) -> Union[dict, None]:
         ...
 
     def get_output(self) -> Any:
         ...
+
+
+def _extract_vote_events(
+        lm: SupportsVoteAndOutput,
+        lm_id: str,
+        timestamp: float,
+) -> List[SpatialEvent]:
+    """Extract SpatialEvents from LM vote.
+
+    Args:
+        lm: Learning module to poll.
+        lm_id: Learning module identifier.
+        timestamp: Event timestamp.
+
+    Returns:
+        List of SpatialEvents from the vote.
+    """
+    events: List[SpatialEvent] = []
+
+    try:
+        vote = lm.send_out_vote()
+    except Exception as e:
+        logger.warning(f"Error getting vote from LM {lm_id}: {e}")
+        return events
+
+    if vote is None:
+        return events
+
+    possible_states = vote.get("possible_states", {})
+
+    for graph_id, states in possible_states.items():
+        for state in states:
+            try:
+                morph_features = getattr(state, "morphological_features", {}) or {}
+
+                event = SpatialEvent(
+                    timestamp=timestamp,
+                    location=np.asarray(state.location),
+                    orientation=np.asarray(
+                        morph_features.get("pose_vectors", np.eye(3))
+                    ),
+                    source_id=lm_id,
+                    confidence=float(getattr(state, "confidence", 0.0)),
+                    features={},
+                    event_type="vote",
+                    object_id=str(graph_id),
+                    extra={
+                        "sensed_pose": vote.get("sensed_pose_rel_body"),
+                        "pose_fully_defined": morph_features.get("pose_fully_defined"),
+                    },
+                )
+                events.append(event)
+            except Exception as e:
+                logger.warning(f"Error processing vote state from LM {lm_id}: {e}")
+
+    return events
+
+
+def _extract_output_event(
+        lm: SupportsVoteAndOutput,
+        lm_id: str,
+        timestamp: float,
+) -> Union[SpatialEvent, None]:
+    """Extract SpatialEvent from LM primary output.
+
+    Args:
+        lm: Learning module to poll.
+        lm_id: Learning module identifier.
+        timestamp: Event timestamp.
+
+    Returns:
+        SpatialEvent from the output, or None if not usable.
+    """
+    try:
+        output = lm.get_output()
+    except Exception as e:
+        logger.warning(f"Error getting output from LM {lm_id}: {e}")
+        return None
+
+    if output is None:
+        return None
+
+    # Only process if use_state is True (LM has confident output)
+    if not getattr(output, "use_state", False):
+        return None
+
+    try:
+        morph_features = getattr(output, "morphological_features", {}) or {}
+        non_morph_features = getattr(output, "non_morphological_features", {}) or {}
+
+        event = SpatialEvent(
+            timestamp=timestamp,
+            location=np.asarray(output.location),
+            orientation=np.asarray(
+                morph_features.get("pose_vectors", np.eye(3))
+            ),
+            source_id=lm_id,
+            confidence=float(getattr(output, "confidence", 0.0)),
+            features=dict(non_morph_features),
+            event_type="output",
+            object_id=non_morph_features.get("object_id"),
+            extra={
+                "pose_fully_defined": morph_features.get("pose_fully_defined"),
+                "on_object": morph_features.get("on_object"),
+            },
+        )
+        return event
+    except Exception as e:
+        logger.warning(f"Error processing output from LM {lm_id}: {e}")
+        return None
 
 
 class MontyAdapter:
@@ -56,10 +166,10 @@ class MontyAdapter:
     """
 
     def __init__(
-        self,
-        hippocampus: EntorhinalCortex,
-        include_votes: bool = True,
-        include_outputs: bool = True,
+            self,
+            hippocampus: EntorhinalCortex,
+            include_votes: bool = True,
+            include_outputs: bool = True,
     ) -> None:
         """Initialize the adapter.
 
@@ -85,7 +195,7 @@ class MontyAdapter:
         return self.consume_from_lms(monty.learning_modules)
 
     def consume_from_lms(
-        self, learning_modules: Sequence[LearningModule | SupportsVoteAndOutput]
+            self, learning_modules: Sequence[Union[LearningModule, SupportsVoteAndOutput]]
     ) -> int:
         """Poll learning modules and forward events to hippocampus.
 
@@ -96,7 +206,7 @@ class MontyAdapter:
             Number of events forwarded.
         """
         self.step_count += 1
-        events: list[SpatialEvent] = []
+        events: List[SpatialEvent] = []
         timestamp = time.time()
 
         for lm in learning_modules:
@@ -108,12 +218,12 @@ class MontyAdapter:
 
             # Process votes
             if self.include_votes:
-                vote_events = self._extract_vote_events(lm, lm_id, timestamp)
+                vote_events = _extract_vote_events(lm, lm_id, timestamp)
                 events.extend(vote_events)
 
             # Process primary output
             if self.include_outputs:
-                output_event = self._extract_output_event(lm, lm_id, timestamp)
+                output_event = _extract_output_event(lm, lm_id, timestamp)
                 if output_event is not None:
                     events.append(output_event)
 
@@ -125,116 +235,6 @@ class MontyAdapter:
             )
 
         return len(events)
-
-    def _extract_vote_events(
-        self,
-        lm: SupportsVoteAndOutput,
-        lm_id: str,
-        timestamp: float,
-    ) -> list[SpatialEvent]:
-        """Extract SpatialEvents from LM vote.
-
-        Args:
-            lm: Learning module to poll.
-            lm_id: Learning module identifier.
-            timestamp: Event timestamp.
-
-        Returns:
-            List of SpatialEvents from the vote.
-        """
-        events: list[SpatialEvent] = []
-
-        try:
-            vote = lm.send_out_vote()
-        except Exception as e:
-            logger.warning(f"Error getting vote from LM {lm_id}: {e}")
-            return events
-
-        if vote is None:
-            return events
-
-        possible_states = vote.get("possible_states", {})
-
-        for graph_id, states in possible_states.items():
-            for state in states:
-                try:
-                    morph_features = getattr(state, "morphological_features", {}) or {}
-
-                    event = SpatialEvent(
-                        timestamp=timestamp,
-                        location=np.asarray(state.location),
-                        orientation=np.asarray(
-                            morph_features.get("pose_vectors", np.eye(3))
-                        ),
-                        source_id=lm_id,
-                        confidence=float(getattr(state, "confidence", 0.0)),
-                        features={},
-                        event_type="vote",
-                        object_id=str(graph_id),
-                        extra={
-                            "sensed_pose": vote.get("sensed_pose_rel_body"),
-                            "pose_fully_defined": morph_features.get("pose_fully_defined"),
-                        },
-                    )
-                    events.append(event)
-                except Exception as e:
-                    logger.warning(f"Error processing vote state from LM {lm_id}: {e}")
-
-        return events
-
-    def _extract_output_event(
-        self,
-        lm: SupportsVoteAndOutput,
-        lm_id: str,
-        timestamp: float,
-    ) -> SpatialEvent | None:
-        """Extract SpatialEvent from LM primary output.
-
-        Args:
-            lm: Learning module to poll.
-            lm_id: Learning module identifier.
-            timestamp: Event timestamp.
-
-        Returns:
-            SpatialEvent from the output, or None if not usable.
-        """
-        try:
-            output = lm.get_output()
-        except Exception as e:
-            logger.warning(f"Error getting output from LM {lm_id}: {e}")
-            return None
-
-        if output is None:
-            return None
-
-        # Only process if use_state is True (LM has confident output)
-        if not getattr(output, "use_state", False):
-            return None
-
-        try:
-            morph_features = getattr(output, "morphological_features", {}) or {}
-            non_morph_features = getattr(output, "non_morphological_features", {}) or {}
-
-            event = SpatialEvent(
-                timestamp=timestamp,
-                location=np.asarray(output.location),
-                orientation=np.asarray(
-                    morph_features.get("pose_vectors", np.eye(3))
-                ),
-                source_id=lm_id,
-                confidence=float(getattr(output, "confidence", 0.0)),
-                features=dict(non_morph_features),
-                event_type="output",
-                object_id=non_morph_features.get("object_id"),
-                extra={
-                    "pose_fully_defined": morph_features.get("pose_fully_defined"),
-                    "on_object": morph_features.get("on_object"),
-                },
-            )
-            return event
-        except Exception as e:
-            logger.warning(f"Error processing output from LM {lm_id}: {e}")
-            return None
 
     def reset(self) -> None:
         """Reset step counter."""

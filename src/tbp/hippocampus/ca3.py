@@ -20,7 +20,7 @@ TEM/SR Extensions:
 - Multi-step prediction: predict_future() for SR-style lookahead
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -28,7 +28,6 @@ import numpy as np
 from .types import SpatialEvent
 
 if TYPE_CHECKING:
-    from .basis import BasisCode
     from .hstate import HState
 
 
@@ -131,14 +130,15 @@ class CA3:
         >>> future = ca3.predict_future(current_hstate, n_steps=5)
     """
 
-    def __init__(self, config: Optional[CA3Config] = None):
+    def __init__(self, config: Optional[CA3Config] = None, seed: Optional[int] = None):
         """Initialize CA3 network.
 
         Args:
             config: CA3 configuration. Uses defaults if not provided.
+            seed: Random seed for reproducibility. If None, uses system entropy.
         """
         self.config = config or CA3Config()
-        self._rng = np.random.default_rng()
+        self._rng = np.random.default_rng(seed)
 
         # Recurrent weight matrix (sparse)
         # Use sparse representation for efficiency
@@ -156,7 +156,7 @@ class CA3:
         self._pattern_to_memory: Dict[Tuple, int] = {}  # Hash -> memory index
 
         # HState storage (id -> HState)
-        self._hstates: Dict[str, "HState"] = {}
+        self._hstates: Dict[str, HState] = {}
         self._pattern_to_hstate: Dict[Tuple, str] = {}  # Pattern hash -> HState id
 
         # Transition graph: sparse dict-of-dicts
@@ -173,7 +173,7 @@ class CA3:
         self._successful_completions = 0
 
     def _create_sparse_mask(
-        self, n: int, n_connections: int
+            self, n: int, n_connections: int
     ) -> Tuple[np.ndarray, np.ndarray]:
         """Create sparse connectivity mask.
 
@@ -193,10 +193,10 @@ class CA3:
         return rows[valid], cols[valid]
 
     def store(
-        self,
-        dg_pattern: np.ndarray,
-        event: SpatialEvent,
-        ca3_pattern: Optional[np.ndarray] = None,
+            self,
+            dg_pattern: np.ndarray,
+            event: SpatialEvent,
+            ca3_pattern: Optional[np.ndarray] = None,
     ) -> bool:
         """Store a pattern from Dentate Gyrus.
 
@@ -227,13 +227,13 @@ class CA3:
 
         # Hebbian learning on recurrent weights
         # Strengthen connections between co-active neurons
-        active_indices = np.where(ca3_pattern > 0)[0]
+        active_indices = np.nonzero(ca3_pattern > 0)[0]
         for i in active_indices:
             for j in active_indices:
                 if i != j:
                     # Only update if connection exists in mask
                     self._recurrent_weights[i, j] += (
-                        self.config.learning_rate * ca3_pattern[i] * ca3_pattern[j]
+                            self.config.learning_rate * ca3_pattern[i] * ca3_pattern[j]
                     )
 
         # Normalize weights to prevent unbounded growth
@@ -276,14 +276,14 @@ class CA3:
         ca3_pattern = np.zeros(self.config.n_pyramidal_cells, dtype=np.float32)
 
         # Sparse random projection
-        active_dg = np.where(dg_pattern > 0)[0]
+        active_dg = np.nonzero(dg_pattern > 0)[0]
         n_ca3_active = min(
             len(active_dg) * 2, self.config.n_active_cells
         )  # Slight expansion
 
         if len(active_dg) > 0:
             # Each DG active neuron activates 2-3 CA3 neurons
-            for dg_idx in active_dg:
+            for _ in range(len(active_dg)):
                 ca3_targets = self._rng.integers(
                     0, self.config.n_pyramidal_cells, size=2
                 )
@@ -291,7 +291,7 @@ class CA3:
 
             # Ensure target sparsity
             if np.sum(ca3_pattern) > n_ca3_active:
-                active = np.where(ca3_pattern > 0)[0]
+                active = np.nonzero(ca3_pattern > 0)[0]
                 keep = self._rng.choice(active, size=n_ca3_active, replace=False)
                 ca3_pattern = np.zeros_like(ca3_pattern)
                 ca3_pattern[keep] = 1.0
@@ -299,8 +299,8 @@ class CA3:
         return ca3_pattern
 
     def pattern_complete(
-        self, partial_cue: np.ndarray, return_event: bool = True
-) -> Tuple[np.ndarray, Optional[SpatialEvent]]:
+            self, partial_cue: np.ndarray, return_event: bool = True
+    ) -> Tuple[np.ndarray, Optional[SpatialEvent]]:
         """Complete a pattern from partial cue using attractor dynamics.
 
         Iteratively updates the pattern based on recurrent weights
@@ -340,7 +340,8 @@ class CA3:
             # Blend with input (partial cue influence)
             blend_factor = 1.0 / (iteration + 2)
             new_pattern = (1 - blend_factor) * new_pattern + blend_factor * (
-                partial_cue[:self.config.n_pyramidal_cells] if len(partial_cue) >= self.config.n_pyramidal_cells else current
+                partial_cue[:self.config.n_pyramidal_cells] if len(partial_cue)
+                                                               >= self.config.n_pyramidal_cells else current
             )
 
             # Check convergence
@@ -381,7 +382,7 @@ class CA3:
 
         for idx, memory in enumerate(self._memories):
             overlap = np.sum(pattern * memory.pattern) / (
-                np.sum(pattern) + np.sum(memory.pattern) + 1e-10
+                    np.sum(pattern) + np.sum(memory.pattern) + 1e-10
             )
             if overlap > best_overlap and overlap > self.config.pattern_completion_threshold:
                 best_overlap = overlap
@@ -433,10 +434,10 @@ class CA3:
     # ==================== Extended Replay (TEM/SR-consistent) ====================
 
     def replay_forward(
-        self,
-        start_hstate: Union["HState", str],
-        depth: int = 5,
-        update_transitions: bool = True,
+            self,
+            start_hstate: Union["HState", str],
+            depth: int = 5,
+            update_transitions: bool = True,
     ) -> List["HState"]:
         """Replay forward trajectory from starting HState.
 
@@ -463,10 +464,10 @@ class CA3:
         return trajectory
 
     def replay_backward(
-        self,
-        end_hstate: Union["HState", str],
-        depth: int = 5,
-        update_transitions: bool = True,
+            self,
+            end_hstate: Union["HState", str],
+            depth: int = 5,
+            update_transitions: bool = True,
     ) -> List["HState"]:
         """Replay backward trajectory to an ending HState.
 
@@ -482,7 +483,7 @@ class CA3:
             List of HStates in backward replay order (most recent predecessor first).
         """
         end_id = self._get_hstate_id(end_hstate)
-        trajectory: List["HState"] = []
+        trajectory: List[HState] = []
         current_id = end_id
 
         for _ in range(depth):
@@ -514,10 +515,10 @@ class CA3:
         return trajectory
 
     def replay_recombine(
-        self,
-        hstate_a: Union["HState", str],
-        hstate_b: Union["HState", str],
-        max_path_length: int = 10,
+            self,
+            hstate_a: Union["HState", str],
+            hstate_b: Union["HState", str],
+            max_path_length: int = 10,
     ) -> List[List["HState"]]:
         """Explore novel paths between two HStates (creativity/planning).
 
@@ -542,46 +543,85 @@ class CA3:
         if id_a not in self._hstates or id_b not in self._hstates:
             return []
 
-        # BFS to find paths
-        paths: List[List["HState"]] = []
+        paths: List[List[HState]] = []
         queue: List[Tuple[str, List[str]]] = [(id_a, [id_a])]
         visited_paths: set = set()
 
-        while queue and len(paths) < 5:  # Limit to 5 paths
+        while queue and len(paths) < 5:
             current_id, path = queue.pop(0)
 
-            if current_id == id_b:
-                # Found a path
-                hstate_path = [self._hstates[pid] for pid in path if pid in self._hstates]
-                if len(hstate_path) == len(path):
-                    paths.append(hstate_path)
+            if self._try_add_path(current_id, path, id_b, paths):
                 continue
 
             if len(path) >= max_path_length:
                 continue
 
-            # Explore successors
-            if current_id in self._transitions:
-                successors = sorted(
-                    self._transitions[current_id].items(),
-                    key=lambda x: x[1].strength,
-                    reverse=True
-                )[:3]  # Top 3 successors
-
-                for next_id, _ in successors:
-                    if next_id not in path:  # Avoid cycles
-                        new_path = path + [next_id]
-                        path_key = tuple(new_path)
-                        if path_key not in visited_paths:
-                            visited_paths.add(path_key)
-                            queue.append((next_id, new_path))
+            self._explore_successors(current_id, path, queue, visited_paths)
 
         return paths
 
+    def _try_add_path(
+            self,
+            current_id: str,
+            path: List[str],
+            target_id: str,
+            paths: List[List["HState"]],
+    ) -> bool:
+        """Try to add a path if target is reached.
+
+        Args:
+            current_id: Current node ID in path.
+            path: Current path as list of IDs.
+            target_id: Target node ID.
+            paths: List to append found paths to.
+
+        Returns:
+            True if target was reached and path was processed.
+        """
+        if current_id != target_id:
+            return False
+
+        hstate_path = [self._hstates[pid] for pid in path if pid in self._hstates]
+        if len(hstate_path) == len(path):
+            paths.append(hstate_path)
+        return True
+
+    def _explore_successors(
+            self,
+            current_id: str,
+            path: List[str],
+            queue: List[Tuple[str, List[str]]],
+            visited_paths: set,
+    ) -> None:
+        """Explore successor nodes and add valid ones to queue.
+
+        Args:
+            current_id: Current node ID.
+            path: Current path as list of IDs.
+            queue: BFS queue to append to.
+            visited_paths: Set of visited path tuples.
+        """
+        if current_id not in self._transitions:
+            return
+
+        successors = sorted(
+            self._transitions[current_id].items(),
+            key=lambda x: x[1].strength,
+            reverse=True
+        )[:3]
+
+        for next_id, _ in successors:
+            if next_id not in path:
+                new_path = path + [next_id]
+                path_key = tuple(new_path)
+                if path_key not in visited_paths:
+                    visited_paths.add(path_key)
+                    queue.append((next_id, new_path))
+
     def replay_sequence(
-        self,
-        hstate_sequence: List[Union["HState", str]],
-        update_transitions: bool = True,
+            self,
+            hstate_sequence: List[Union["HState", str]],
+            update_transitions: bool = True,
     ) -> List["HState"]:
         """Replay a specific sequence of HStates.
 
@@ -594,7 +634,7 @@ class CA3:
         Returns:
             List of successfully replayed HStates.
         """
-        replayed: List["HState"] = []
+        replayed: List[HState] = []
 
         for i, hstate in enumerate(hstate_sequence):
             hstate_id = self._get_hstate_id(hstate)
@@ -625,13 +665,13 @@ class CA3:
             return 1.0
 
         # Try pattern completion
-        completed, event = self.pattern_complete(pattern, return_event=False)
+        completed, _ = self.pattern_complete(pattern, return_event=False)
 
         # Novelty is inverse of best match quality
         best_overlap = 0.0
         for memory in self._memories:
             overlap = np.sum(completed * memory.pattern) / (
-                np.sum(completed) + np.sum(memory.pattern) + 1e-10
+                    np.sum(completed) + np.sum(memory.pattern) + 1e-10
             )
             best_overlap = max(best_overlap, overlap)
 
@@ -665,7 +705,7 @@ class CA3:
         Returns:
             Tuple of active indices for hashing.
         """
-        return tuple(np.where(pattern > 0.5)[0])
+        return tuple(np.nonzero(pattern > 0.5)[0])
 
     @property
     def n_memories(self) -> int:
@@ -704,7 +744,7 @@ class CA3:
             "total_retrievals": self._total_retrievals,
             "successful_completions": self._successful_completions,
             "completion_rate": (
-                self._successful_completions / max(1, self._total_retrievals)
+                    self._successful_completions / max(1, self._total_retrievals)
             ),
             "memory_utilization": len(self._memories) / self.config.memory_capacity,
         }
@@ -727,12 +767,12 @@ class CA3:
     # ==================== HState Encoding ====================
 
     def encode_to_hstate(
-        self,
-        dg_pattern: np.ndarray,
-        event: SpatialEvent,
-        basis_vector: np.ndarray,
-        context_tag: Optional[str] = None,
-        update_transitions: bool = True,
+            self,
+            dg_pattern: np.ndarray,
+            event: SpatialEvent,
+            basis_vector: np.ndarray,
+            context_tag: Optional[str] = None,
+            update_transitions: bool = True,
     ) -> "HState":
         """Encode a DG pattern and event into an HState.
 
@@ -802,9 +842,9 @@ class CA3:
         return hstate
 
     def retrieve_hstate(
-        self,
-        partial_cue: np.ndarray,
-        update_current: bool = True,
+            self,
+            partial_cue: np.ndarray,
+            update_current: bool = True,
     ) -> Optional["HState"]:
         """Retrieve HState from partial pattern cue.
 
@@ -850,10 +890,10 @@ class CA3:
     # ==================== Transition Graph (SR Foundation) ====================
 
     def register_transition(
-        self,
-        from_hstate_id: str,
-        to_hstate_id: str,
-        weight: float = 1.0,
+            self,
+            from_hstate_id: str,
+            to_hstate_id: str,
+            weight: float = 1.0,
     ) -> None:
         """Register a transition between two HStates.
 
@@ -879,7 +919,7 @@ class CA3:
         if to_hstate_id in self._hstates:
             hstate = self._hstates[to_hstate_id]
             # Use HState timestamp if available, otherwise use current time
-            if hasattr(hstate, 'timestamp') and hstate.timestamp is not None:
+            if hasattr(hstate, "timestamp") and hstate.timestamp is not None:
                 entry.recency = hstate.timestamp
             else:
                 # Fallback to current time if timestamp not available
@@ -892,8 +932,8 @@ class CA3:
 
         # Incremental strength update with decay
         entry.strength = (
-            (1 - self.config.transition_learning_rate) * entry.strength
-            + self.config.transition_learning_rate * weight
+                (1 - self.config.transition_learning_rate) * entry.strength
+                + self.config.transition_learning_rate * weight
         )
 
         # Apply decay to other transitions from this state
@@ -915,9 +955,9 @@ class CA3:
         return hstate.id
 
     def successors(
-        self,
-        hstate: Union["HState", str],
-        min_strength: float = 0.0,
+            self,
+            hstate: Union["HState", str],
+            min_strength: float = 0.0,
     ) -> List["HState"]:
         """Get successor HStates from transition graph.
 
@@ -933,7 +973,7 @@ class CA3:
         if hstate_id not in self._transitions:
             return []
 
-        successors_list: List[Tuple["HState", float]] = []
+        successors_list: List[Tuple[HState, float]] = []
         for to_id, entry in self._transitions[hstate_id].items():
             if entry.strength >= min_strength and to_id in self._hstates:
                 successors_list.append((self._hstates[to_id], entry.strength))
@@ -943,8 +983,8 @@ class CA3:
         return [s[0] for s in successors_list]
 
     def transition_probability(
-        self,
-        hstate: Union["HState", str],
+            self,
+            hstate: Union["HState", str],
     ) -> Dict[str, float]:
         """Get normalized transition probabilities from an HState.
 
@@ -972,9 +1012,9 @@ class CA3:
         return {to_id: s / total for to_id, s in strengths.items()}
 
     def sample_next(
-        self,
-        hstate: Union["HState", str],
-        stochastic: bool = True,
+            self,
+            hstate: Union["HState", str],
+            stochastic: bool = True,
     ) -> Optional["HState"]:
         """Sample next HState from transition distribution.
 
@@ -1001,10 +1041,10 @@ class CA3:
         return self._hstates.get(chosen_id)
 
     def predict_future(
-        self,
-        hstate: Union["HState", str],
-        n_steps: int = 5,
-        stochastic: bool = False,
+            self,
+            hstate: Union["HState", str],
+            n_steps: int = 5,
+            stochastic: bool = False,
     ) -> List["HState"]:
         """Predict future HStates using SR-style multi-step prediction.
 
@@ -1032,10 +1072,10 @@ class CA3:
         return predictions
 
     def compute_sr_vector(
-        self,
-        hstate: Union["HState", str],
-        n_steps: int = 10,
-        gamma: Optional[float] = None,
+            self,
+            hstate: Union["HState", str],
+            n_steps: int = 10,
+            gamma: Optional[float] = None,
     ) -> np.ndarray:
         """Compute Successor Representation vector for an HState.
 

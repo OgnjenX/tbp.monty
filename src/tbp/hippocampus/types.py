@@ -7,7 +7,7 @@ for spatial events that the hippocampus processes.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Dict
 
 import numpy as np
 
@@ -50,10 +50,10 @@ class SpatialEvent:
     orientation: np.ndarray  # shape (3, 3)
     source_id: str
     confidence: float
-    features: dict[str, Any] = field(default_factory=dict)
+    features: Dict[str, Any] = field(default_factory=dict)
     event_type: str = "observation"
     object_id: Any = None
-    extra: dict[str, Any] = field(default_factory=dict)
+    extra: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
         """Validate and convert arrays."""
@@ -67,7 +67,7 @@ class SpatialEvent:
                 f"orientation must have shape (3, 3), got {self.orientation.shape}"
             )
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for serialization."""
         return {
             "timestamp": self.timestamp,
@@ -82,7 +82,7 @@ class SpatialEvent:
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> SpatialEvent:
+    def from_dict(cls, data: Dict[str, Any]) -> SpatialEvent:
         """Create from dictionary."""
         return cls(
             timestamp=data["timestamp"],
@@ -113,6 +113,13 @@ class PlaceCell:
     radius: float
     activation: float = 0.0
 
+    def __post_init__(self) -> None:
+        """Validate and normalize the place cell parameters."""
+        self.center = np.asarray(self.center, dtype=np.float64)
+        if self.center.shape != (3,):
+            raise ValueError(f"center must have shape (3,), got {self.center.shape}")
+        self.radius = float(self.radius)
+
     def compute_activation(self, location: np.ndarray) -> float:
         """Compute activation given a location.
 
@@ -124,8 +131,12 @@ class PlaceCell:
         Returns:
             Activation level [0, 1].
         """
-        distance = np.linalg.norm(location - self.center)
-        self.activation = float(np.exp(-(distance**2) / (2 * self.radius**2)))
+        loc = np.asarray(location, dtype=np.float64)
+        if loc.shape != (3,):
+            # allow inputs with extra dims (e.g., 2D + z) by flattening/trim
+            loc = loc.flatten()[:3]
+        distance = float(np.linalg.norm(loc - self.center))
+        self.activation = float(np.exp(-(distance ** 2) / (2.0 * float(self.radius) ** 2)))
         return self.activation
 
 
@@ -147,6 +158,14 @@ class GridCell:
     phase: np.ndarray  # shape (2,)
     activation: float = 0.0
 
+    def __post_init__(self) -> None:
+        """Validate and normalize grid cell parameters."""
+        self.phase = np.asarray(self.phase, dtype=np.float64).flatten()
+        if self.phase.shape != (2,):
+            raise ValueError(f"phase must have shape (2,), got {self.phase.shape}")
+        self.orientation = float(self.orientation)
+        self.spacing = float(self.spacing)
+
     def compute_activation(self, location: np.ndarray) -> float:
         """Compute grid cell activation for a 2D location.
 
@@ -158,7 +177,8 @@ class GridCell:
         Returns:
             Activation level.
         """
-        loc_2d = location[:2] - self.phase
+        loc_arr = np.asarray(location, dtype=np.float64)
+        loc_2d = loc_arr[:2] - self.phase
 
         # Rotate to grid orientation
         cos_theta = np.cos(self.orientation)

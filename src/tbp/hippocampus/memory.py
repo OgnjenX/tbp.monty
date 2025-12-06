@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import threading
 from collections import deque
-from typing import Callable
+from typing import Callable, List, Optional
 
 from tbp.hippocampus.types import SpatialEvent
 
@@ -44,7 +44,7 @@ class EpisodicMemory:
             self._buffer.append(event)
             self._total_received += 1
 
-    def store_batch(self, events: list[SpatialEvent]) -> None:
+    def store_batch(self, events: List[SpatialEvent]) -> None:
         """Store multiple events.
 
         Args:
@@ -54,7 +54,7 @@ class EpisodicMemory:
             self._buffer.extend(events)
             self._total_received += len(events)
 
-    def get_recent(self, n: int | None = None) -> list[SpatialEvent]:
+    def get_recent(self, n: Optional[int] = None) -> List[SpatialEvent]:
         """Retrieve most recent events.
 
         Args:
@@ -68,11 +68,11 @@ class EpisodicMemory:
                 return list(self._buffer)
             return list(self._buffer)[-n:]
 
-    def get_all(self) -> list[SpatialEvent]:
+    def get_all(self) -> List[SpatialEvent]:
         """Retrieve all stored events."""
         return self.get_recent(None)
 
-    def get_by_source(self, source_id: str) -> list[SpatialEvent]:
+    def get_by_source(self, source_id: str) -> List[SpatialEvent]:
         """Retrieve events from a specific source.
 
         Args:
@@ -84,7 +84,7 @@ class EpisodicMemory:
         with self._lock:
             return [e for e in self._buffer if e.source_id == source_id]
 
-    def get_by_object(self, object_id) -> list[SpatialEvent]:
+    def get_by_object(self, object_id) -> List[SpatialEvent]:
         """Retrieve events associated with a specific object.
 
         Args:
@@ -97,8 +97,8 @@ class EpisodicMemory:
             return [e for e in self._buffer if e.object_id == object_id]
 
     def query(
-        self, predicate: Callable[[SpatialEvent], bool]
-    ) -> list[SpatialEvent]:
+            self, predicate: Callable[[SpatialEvent], bool]
+    ) -> List[SpatialEvent]:
         """Query events using a custom predicate.
 
         Args:
@@ -110,7 +110,7 @@ class EpisodicMemory:
         with self._lock:
             return [e for e in self._buffer if predicate(e)]
 
-    def flush(self) -> list[SpatialEvent]:
+    def flush(self) -> List[SpatialEvent]:
         """Clear buffer and return all events.
 
         Returns:

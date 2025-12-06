@@ -96,12 +96,6 @@ Structure:
     tbp.hippocampus.adapters      - Integration adapters (e.g., MontyAdapter)
 """
 
-# Core types (backwards compatible)
-from tbp.hippocampus.types import SpatialEvent
-
-# HState latent representation (new)
-from tbp.hippocampus.hstate import HState
-
 # Basis code system (new)
 from tbp.hippocampus.basis import (
     BasisCode,
@@ -113,32 +107,30 @@ from tbp.hippocampus.basis import (
     IdentityBasis,
     create_spatial_basis,
 )
-
-# Entorhinal Cortex
-from tbp.hippocampus.entorhinal import EntorhinalCortex
-
-# Dentate Gyrus
-from tbp.hippocampus.dentate_gyrus import DentateGyrus, DGConfig
-
-# CA3 (extended with transition graph)
-from tbp.hippocampus.ca3 import CA3, CA3Config, CA3Memory, TransitionEntry
-
 # CA1 (extended with cortical mapping)
 from tbp.hippocampus.ca1 import CA1, CA1Config, ComparisonResult
-
-# Episodic memory
-from tbp.hippocampus.memory import EpisodicMemory
-
+# CA3 (extended with transition graph)
+from tbp.hippocampus.ca3 import CA3, CA3Config, CA3Memory, TransitionEntry
+# Dentate Gyrus
+from tbp.hippocampus.dentate_gyrus import DentateGyrus, DGConfig
+# Entorhinal Cortex
+from tbp.hippocampus.entorhinal import EntorhinalCortex
 # High-level API (new)
 from tbp.hippocampus.hippocampus import Hippocampus, HippocampusConfig
+# HState latent representation (new)
+from tbp.hippocampus.hstate import HState
+# Episodic memory
+from tbp.hippocampus.memory import EpisodicMemory
+# Core types (backwards compatible)
+from tbp.hippocampus.types import SpatialEvent
 
 __all__ = [
     # === Core types (backwards compatible) ===
     "SpatialEvent",
-    
+
     # === HState latent representation (new) ===
     "HState",
-    
+
     # === Basis code system (new) ===
     "BasisCode",
     "BasisConfig",
@@ -148,28 +140,28 @@ __all__ = [
     "CombinedBasis",
     "IdentityBasis",
     "create_spatial_basis",
-    
+
     # === Entorhinal Cortex ===
     "EntorhinalCortex",
-    
+
     # === Dentate Gyrus ===
     "DentateGyrus",
     "DGConfig",
-    
+
     # === CA3 (extended) ===
     "CA3",
     "CA3Config",
     "CA3Memory",
     "TransitionEntry",
-    
+
     # === CA1 (extended) ===
     "CA1",
     "CA1Config",
     "ComparisonResult",
-    
+
     # === Memory ===
     "EpisodicMemory",
-    
+
     # === High-level API (new) ===
     "Hippocampus",
     "HippocampusConfig",

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from typing import Union
 
 import numpy as np
 
@@ -38,6 +39,7 @@ class DGConfig:
         novelty_threshold: Threshold for novelty detection.
         neurogenesis_rate: Rate at which "new" cells become excitable (0-1).
             Models adult neurogenesis effect.
+        seed: Random seed for reproducible results. If None, uses random seed.
     """
 
     n_input: int = 100
@@ -47,6 +49,7 @@ class DGConfig:
     inhibition_strength: float = 1.0
     novelty_threshold: float = 0.3
     neurogenesis_rate: float = 0.01  # 1% of cells are "young" and excitable
+    seed: Union[int, None] = None
 
     def __post_init__(self):
         # If using default, compute from expansion factor
@@ -56,8 +59,9 @@ class DGConfig:
         # Validate sparsity is in biological range
         if not 0.001 <= self.sparsity <= 0.01:
             logger.warning(
-                f"DG sparsity {self.sparsity} outside biological range [0.001, 0.01]. "
-                "Biological DG uses 0.1-1% active cells."
+                "DG sparsity %s outside biological range [0.001, 0.01]. "
+                "Biological DG uses 0.1-1%% active cells.",
+                self.sparsity,
             )
 
 
@@ -106,13 +110,14 @@ class DentateGyrus:
         cell_ages: Age of each cell (models neurogenesis; young = more excitable).
     """
 
-    def __init__(self, config: DGConfig | None = None) -> None:
+    def __init__(self, config: Union[DGConfig, None] = None) -> None:
         """Initialize Dentate Gyrus.
 
         Args:
             config: Configuration. Uses defaults if None.
         """
         self.config = config or DGConfig()
+        self.rng = np.random.default_rng(self.config.seed)
         self._initialize_weights()
         self._initialize_cell_ages()
 
@@ -128,11 +133,11 @@ class DentateGyrus:
         """
         # Sparse connectivity: each DG cell connects to ~20% of EC inputs
         connectivity = 0.2
-        self.weights = np.random.randn(
-            self.config.n_granule_cells, self.config.n_input
+        self.weights = self.rng.standard_normal(
+            (self.config.n_granule_cells, self.config.n_input)
         )
         # Sparsify connections
-        mask = np.random.random(self.weights.shape) > connectivity
+        mask = self.rng.random(self.weights.shape) > connectivity
         self.weights[mask] = 0
         # Normalize rows so each cell has similar total input
         row_norms = np.linalg.norm(self.weights, axis=1, keepdims=True)
@@ -146,7 +151,7 @@ class DentateGyrus:
         encode novel patterns. This models adult neurogenesis in DG.
         """
         # Most cells are "mature" (high age), some are "young" (low age)
-        self.cell_ages = np.random.exponential(scale=10.0, size=self.config.n_granule_cells)
+        self.cell_ages = self.rng.exponential(scale=10.0, size=self.config.n_granule_cells)
         # Normalize to [0, 1] where 0 = newborn, 1 = fully mature
         self.cell_ages = 1 - np.exp(-self.cell_ages / 10)
 
@@ -173,7 +178,7 @@ class DentateGyrus:
         activations = self.weights @ ec_input
 
         # 2. Add noise for stochasticity
-        noise = np.random.randn(self.config.n_granule_cells) * 0.1
+        noise = self.rng.standard_normal(self.config.n_granule_cells) * 0.1
         activations += noise
 
         # 3. Modulate by cell age (young cells more excitable for novel input)
@@ -247,7 +252,7 @@ class DentateGyrus:
             else:
                 similarities.append(0.0)
 
-        # Novelty = 1 - max_similarity
+        # Novelty is: 1 - max_similarity
         max_similarity = max(similarities) if similarities else 0.0
         return 1.0 - max(0.0, max_similarity)
 
@@ -264,7 +269,7 @@ class DentateGyrus:
         model the continuous generation of new granule cells in DG.
         """
         n_new = max(1, int(self.config.n_granule_cells * self.config.neurogenesis_rate))
-        new_cell_indices = np.random.choice(
+        new_cell_indices = self.rng.choice(
             self.config.n_granule_cells, size=n_new, replace=False
         )
         # Make selected cells "young" (age = 0)

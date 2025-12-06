@@ -154,12 +154,12 @@ class HState:
 
     @classmethod
     def from_ca3_pattern(
-        cls,
-        ca3_pattern: np.ndarray,
-        basis_vector: np.ndarray,
-        timestamp: float,
-        threshold: float = 0.5,
-        **kwargs,
+            cls,
+            ca3_pattern: np.ndarray,
+            basis_vector: np.ndarray,
+            timestamp: float,
+            threshold: float = 0.5,
+            **kwargs,
     ) -> HState:
         """Create HState from a CA3 pattern array.
 
@@ -185,12 +185,12 @@ class HState:
 
     @classmethod
     def from_spatial_event(
-        cls,
-        event: SpatialEvent,
-        ca3_pattern: np.ndarray,
-        basis_vector: np.ndarray,
-        threshold: float = 0.5,
-        context_tag: Optional[str] = None,
+            cls,
+            event: SpatialEvent,
+            ca3_pattern: np.ndarray,
+            basis_vector: np.ndarray,
+            threshold: float = 0.5,
+            context_tag: Optional[str] = None,
     ) -> HState:
         """Create HState from a SpatialEvent and its CA3 encoding.
 

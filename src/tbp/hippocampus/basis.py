@@ -42,7 +42,7 @@ Example:
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Union
 
 import numpy as np
@@ -274,11 +274,11 @@ class MetricGridBasis(BasisCode):
         return result
 
     def _compute_grid_activation(
-        self,
-        location: np.ndarray,
-        spacing: float,
-        phase: np.ndarray,
-        orientation: float,
+            self,
+            location: np.ndarray,
+            spacing: float,
+            phase: np.ndarray,
+            orientation: float,
     ) -> List[float]:
         """Compute single grid cell activation (3 cosines at 60°).
 
@@ -424,11 +424,11 @@ class CombinedBasis(BasisCode):
     """
 
     def __init__(
-        self,
-        bases: List[BasisCode],
-        weights: Optional[List[float]] = None,
-        names: Optional[List[str]] = None,
-        normalize: bool = True,
+            self,
+            bases: List[BasisCode],
+            weights: Optional[List[float]] = None,
+            names: Optional[List[str]] = None,
+            normalize: bool = True,
     ) -> None:
         """Initialize CombinedBasis.
 
@@ -485,45 +485,104 @@ class CombinedBasis(BasisCode):
             >>> combined = CombinedBasis([grid_basis, place_basis])
             >>> code = combined.encode(np.array([1.0, 2.0]))
         """
-        encodings = []
-
         if isinstance(input_data, dict):
-            if self.names is not None:
-                # Use semantic names to access dict
-                for i, (basis, weight, name) in enumerate(zip(self.bases, self.weights, self.names)):
-                    if name not in input_data:
-                        raise ValueError(
-                            f"Input dict missing required key '{name}' for basis {i}. "
-                            f"Available keys: {list(input_data.keys())}"
-                        )
-                    inp = input_data[name]
-                    encoded = basis.encode(inp) * weight
-                    encodings.append(encoded)
-            else:
-                # Fallback: try numeric string keys "0", "1", etc., or use entire dict
-                # This maintains backward compatibility
-                for i, (basis, weight) in enumerate(zip(self.bases, self.weights)):
-                    key = str(i)
-                    if key in input_data:
-                        inp = input_data[key]
-                    else:
-                        # If no numeric key, pass the whole dict and let basis handle it
-                        inp = input_data
-                    encoded = basis.encode(inp) * weight
-                    encodings.append(encoded)
+            encodings = self._encode_dict_input(input_data)
         else:
-            # Single input: pass to all bases
-            for basis, weight in zip(self.bases, self.weights):
-                encoded = basis.encode(input_data) * weight
-                encodings.append(encoded)
+            encodings = self._encode_single_input(input_data)
 
         result = np.concatenate(encodings)
+        return self._normalize_result(result)
 
+    def _encode_dict_input(self, input_data: Dict[str, Any]) -> List[np.ndarray]:
+        """Encode dict input using semantic names or numeric keys.
+
+        Args:
+            input_data: Dictionary of inputs.
+
+        Returns:
+            List of encoded arrays.
+
+        Raises:
+            ValueError: If required keys are missing and names are specified.
+        """
+        if self.names is not None:
+            return self._encode_dict_with_names(input_data)
+        return self._encode_dict_fallback(input_data)
+
+    def _encode_dict_with_names(self, input_data: Dict[str, Any]) -> List[np.ndarray]:
+        """Encode using semantic names to access dict.
+
+        Args:
+            input_data: Dictionary of inputs.
+
+        Returns:
+            List of encoded arrays.
+
+        Raises:
+            ValueError: If required keys are missing.
+        """
+        encodings = []
+        for i, (basis, weight, name) in enumerate(zip(self.bases, self.weights, self.names)):
+            if name not in input_data:
+                raise ValueError(
+                    f"Input dict missing required key '{name}' for basis {i}. "
+                    f"Available keys: {list(input_data.keys())}"
+                )
+            inp = input_data[name]
+            encoded = basis.encode(inp) * weight
+            encodings.append(encoded)
+        return encodings
+
+    def _encode_dict_fallback(self, input_data: Dict[str, Any]) -> List[np.ndarray]:
+        """Encode dict using numeric string keys or entire dict.
+
+        Args:
+            input_data: Dictionary of inputs.
+
+        Returns:
+            List of encoded arrays.
+        """
+        encodings = []
+        for i, (basis, weight) in enumerate(zip(self.bases, self.weights)):
+            key = str(i)
+            if key not in input_data:
+                raise ValueError(
+                    f"Input dict missing required numeric key '{key}' for basis {i}. "
+                    f"Available keys: {list(input_data.keys())}"
+                )
+            inp = input_data[key]
+            encoded = basis.encode(inp) * weight
+            encodings.append(encoded)
+        return encodings
+
+    def _encode_single_input(self, input_data: Any) -> List[np.ndarray]:
+        """Encode single input passed to all bases.
+
+        Args:
+            input_data: Input to encode.
+
+        Returns:
+            List of encoded arrays.
+        """
+        encodings = []
+        for basis, weight in zip(self.bases, self.weights):
+            encoded = basis.encode(input_data) * weight
+            encodings.append(encoded)
+        return encodings
+
+    def _normalize_result(self, result: np.ndarray) -> np.ndarray:
+        """Normalize result if configured.
+
+        Args:
+            result: Array to normalize.
+
+        Returns:
+            Normalized array.
+        """
         if self._normalize:
             norm = np.linalg.norm(result)
             if norm > 1e-10:
                 result = result / norm
-
         return result
 
     @property
@@ -590,11 +649,11 @@ class IdentityBasis(BasisCode):
 
 
 def create_spatial_basis(
-    n_modules: int = 8,
-    n_phases: int = 4,
-    include_place_cells: bool = True,
-    n_place_cells: int = 50,
-    seed: Optional[int] = None,
+        n_modules: int = 8,
+        n_phases: int = 4,
+        include_place_cells: bool = True,
+        n_place_cells: int = 50,
+        seed: Optional[int] = None,
 ) -> BasisCode:
     """Create a standard spatial encoding basis.
 

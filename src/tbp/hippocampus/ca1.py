@@ -20,9 +20,9 @@ TEM/Monty Extensions:
 - Inference of hippocampal states from cortical patterns
 """
 
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 import hashlib
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 
@@ -116,6 +116,18 @@ class SequenceElement:
     position: int
 
 
+def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    """Safe cosine similarity between two vectors.
+
+    Returns 0.0 when one of the vectors is (near) zero to avoid divide-by-zero.
+    """
+    norm1 = np.linalg.norm(a)
+    norm2 = np.linalg.norm(b)
+    if norm1 > 1e-10 and norm2 > 1e-10:
+        return float(np.dot(a, b) / (norm1 * norm2))
+    return 0.0
+
+
 class CA1:
     """CA1 comparator network with cortical SDR mapping.
 
@@ -143,20 +155,21 @@ class CA1:
         >>> result = ca1.compare(ca3_pattern, ec_pattern, event)
         >>> if result.is_match:
         ...     print("Familiar location!")
-        >>> else:
+        ... else:
         ...     print(f"Novelty detected: {result.novelty_signal:.2f}")
         >>> # Map HState to cortical pattern
         >>> cortical_sdr = ca1.predict_cortical_pattern(hstate)
     """
 
-    def __init__(self, config: Optional[CA1Config] = None):
+    def __init__(self, config: Optional[CA1Config] = None, seed: Optional[int] = None):
         """Initialize CA1 network.
 
         Args:
             config: CA1 configuration. Uses defaults if not provided.
+            seed: Random seed for reproducibility. If None, uses system entropy.
         """
         self.config = config or CA1Config()
-        self._rng = np.random.default_rng()
+        self._rng = np.random.default_rng(seed)
 
         n = self.config.n_pyramidal_cells
 
@@ -190,10 +203,10 @@ class CA1:
         self._novelty_history: List[float] = []
 
     def compare(
-        self,
-        ca3_pattern: np.ndarray,
-        ec_pattern: np.ndarray,
-        event: SpatialEvent,
+            self,
+            ca3_pattern: np.ndarray,
+            ec_pattern: np.ndarray,
+            event: SpatialEvent,
     ) -> ComparisonResult:
         """Compare CA3 prediction with EC input.
 
@@ -216,8 +229,8 @@ class CA1:
         ec_input = self._project_ec(ec_pattern)
 
         # Compute match score (overlap between CA3 and EC representations)
-        ca3_norm = np.linalg.norm(ca3_input) + 1e-10
-        ec_norm = np.linalg.norm(ec_input) + 1e-10
+        ca3_norm = float(np.linalg.norm(ca3_input)) + 1e-10
+        ec_norm = float(np.linalg.norm(ec_input)) + 1e-10
         match_score = float(np.dot(ca3_input, ec_input) / (ca3_norm * ec_norm))
         match_score = max(0.0, min(1.0, match_score))  # Clamp to [0, 1]
 
@@ -312,8 +325,6 @@ class CA1:
         Returns:
             Sparse binary output pattern.
         """
-        n_active = int(self.config.n_pyramidal_cells * self.config.output_sparsity)
-
         # Winner-take-all: keep top n_active activations
         if np.any(pattern > 0):
             threshold = np.percentile(pattern[pattern > 0], 100 * (1 - self.config.output_sparsity))
@@ -324,7 +335,7 @@ class CA1:
         return output
 
     def _mismatch_learning(
-        self, ca3_input: np.ndarray, ec_input: np.ndarray
+            self, ca3_input: np.ndarray, ec_input: np.ndarray
     ) -> None:
         """Update weights based on mismatch.
 
@@ -348,7 +359,7 @@ class CA1:
             self._ca3_weights /= max_weight
 
     def _update_sequence(
-        self, pattern: np.ndarray, event: SpatialEvent
+            self, pattern: np.ndarray, event: SpatialEvent
     ) -> Optional[int]:
         """Update sequence tracking.
 
@@ -365,8 +376,8 @@ class CA1:
 
         # Check if this continues the current sequence
         if (
-            self._last_timestamp is not None
-            and current_time - self._last_timestamp < self.config.temporal_window
+                self._last_timestamp is not None
+                and current_time - self._last_timestamp < self.config.temporal_window
         ):
             # Continue sequence
             position = len(self._current_sequence)
@@ -399,7 +410,7 @@ class CA1:
             return 0
 
     def predict_next(
-        self, current_pattern: np.ndarray
+            self, current_pattern: np.ndarray
     ) -> Tuple[Optional[np.ndarray], float]:
         """Predict the next pattern in a sequence.
 
@@ -421,7 +432,7 @@ class CA1:
             for i, element in enumerate(sequence[:-1]):
                 # Check if current matches this sequence element
                 overlap = np.sum(current_pattern * element.pattern) / (
-                    np.sum(current_pattern) + np.sum(element.pattern) + 1e-10
+                        np.sum(current_pattern) + np.sum(element.pattern) + 1e-10
                 )
 
                 if overlap > best_confidence:
@@ -449,7 +460,7 @@ class CA1:
         for sequence in self._sequences:
             for element in sequence:
                 overlap = np.sum(pattern * element.pattern) / (
-                    np.sum(pattern) + np.sum(element.pattern) + 1e-10
+                        np.sum(pattern) + np.sum(element.pattern) + 1e-10
                 )
                 max_familiarity = max(max_familiarity, float(overlap))
 
@@ -520,10 +531,10 @@ class CA1:
         return hstate.id
 
     def learn_hstate_cortical_mapping(
-        self,
-        hstate: Union["HState", str],
-        cortical_sdr: np.ndarray,
-        ca1_pattern: Optional[np.ndarray] = None,
+            self,
+            hstate: Union["HState", str],
+            cortical_sdr: np.ndarray,
+            ca1_pattern: Optional[np.ndarray] = None,
     ) -> None:
         """Learn association between HState and cortical SDR.
 
@@ -565,9 +576,9 @@ class CA1:
         self._update_cortical_weights(ca1_pattern, cortical_sdr)
 
     def _update_cortical_weights(
-        self,
-        ca1_pattern: np.ndarray,
-        cortical_sdr: np.ndarray,
+            self,
+            ca1_pattern: np.ndarray,
+            cortical_sdr: np.ndarray,
     ) -> None:
         """Update Hebbian weights for cortical mapping.
 
@@ -617,9 +628,9 @@ class CA1:
             self._cortical_to_ca1_weights /= max_weight
 
     def predict_cortical_pattern(
-        self,
-        hstate: Union["HState", str],
-        use_hebbian: bool = True,
+            self,
+            hstate: Union["HState", str],
+            use_hebbian: bool = True,
     ) -> Optional[np.ndarray]:
         """Predict cortical SDR pattern from HState.
 
@@ -638,20 +649,13 @@ class CA1:
 
         if use_hebbian and self._ca1_to_cortical_weights is not None:
             # Find CA1 pattern for this HState
-            ca1_pattern = None
-            for stored_id, _, stored_ca1 in self._cortical_associations:
-                if stored_id == hstate_id:
-                    ca1_pattern = stored_ca1
-                    break
+            ca1_pattern = self._find_ca1_pattern(hstate_id)
 
             if ca1_pattern is not None:
                 # Use Hebbian weights to predict cortical pattern
                 predicted = self._ca1_to_cortical_weights @ ca1_pattern
                 # Apply sparsity (winner-take-all)
-                n_active = max(1, int(len(predicted) * self.config.cortical_sparsity))
-                if n_active > 0:
-                    threshold = np.partition(predicted, -n_active)[-n_active]
-                    predicted = (predicted >= threshold).astype(np.float32)
+                predicted = self._apply_cortical_sparsity(predicted)
                 return predicted
 
         # Fall back to direct lookup
@@ -661,71 +665,87 @@ class CA1:
 
         return None
 
+    def _find_ca1_pattern(self, hstate_id: str) -> Optional[np.ndarray]:
+        """Find CA1 pattern for a given HState ID.
+
+        Args:
+            hstate_id: HState ID to lookup.
+
+        Returns:
+            Corresponding CA1 pattern, or None if not found.
+        """
+        for stored_id, _, stored_ca1 in self._cortical_associations:
+            if stored_id == hstate_id:
+                return stored_ca1
+        return None
+
+    def _apply_cortical_sparsity(self, predicted: np.ndarray) -> np.ndarray:
+        """Apply cortical sparsity to predicted pattern.
+
+        Args:
+            predicted: Predicted cortical pattern (dense).
+
+        Returns:
+            Sparse binary cortical pattern.
+        """
+        n_active = max(1, int(len(predicted) * self.config.cortical_sparsity))
+        if n_active > 0:
+            threshold = np.partition(predicted, -n_active)[-n_active]
+            predicted = (predicted >= threshold).astype(np.float32)
+        return predicted
+
+    def _scores_from_inferred(self, inferred_ca1: np.ndarray) -> Dict[str, float]:
+        """Compute similarity scores between an inferred CA1 pattern and stored CA1 patterns."""
+        # Use the module-level cosine helper to reduce method size and complexity
+        return {
+            stored_id: _cosine_similarity(inferred_ca1, stored_ca1)
+            for stored_id, _, stored_ca1 in self._cortical_associations
+        }
+
+    def _scores_from_cortical(self, cortical_sdr: np.ndarray) -> Dict[str, float]:
+        """Compute similarity scores between a cortical SDR and stored cortical SDRs."""
+        # Use the module-level cosine helper to reduce method size and complexity
+        return {
+            stored_id: _cosine_similarity(cortical_sdr, stored_cortical)
+            for stored_id, stored_cortical, _ in self._cortical_associations
+        }
+
     def infer_hstate_from_cortical(
-        self,
-        cortical_sdr: np.ndarray,
-        use_hebbian: bool = True,
-        return_scores: bool = False,
+            self,
+            cortical_sdr: np.ndarray,
+            use_hebbian: bool = True,
+            return_scores: bool = False,
     ) -> Union[Optional[str], Tuple[Optional[str], Dict[str, float]]]:
         """Infer HState ID from cortical SDR pattern.
 
-        Uses the learned cortical → HState mapping to find the
-        hippocampal state that best matches the cortical pattern.
-
-        Args:
-            cortical_sdr: Cortical SDR pattern to match.
-            use_hebbian: If True, use Hebbian weights for inference.
-            return_scores: If True, also return match scores for all candidates.
-
-        Returns:
-            If return_scores is False: Best matching HState ID, or None.
-            If return_scores is True: Tuple of (best HState ID, dict of scores).
+        Refactored to delegate similarity computations to helpers to reduce
+        cognitive complexity.
         """
         cortical_sdr = np.asarray(cortical_sdr, dtype=np.float32).flatten()
-        scores: Dict[str, float] = {}
 
+        # Choose scoring strategy
         if use_hebbian and self._cortical_to_ca1_weights is not None:
-            # Use Hebbian weights to infer CA1 pattern
             inferred_ca1 = self._cortical_to_ca1_weights @ cortical_sdr
-
-            # Match against stored associations
-            for stored_id, _, stored_ca1 in self._cortical_associations:
-                # Cosine similarity
-                norm1 = np.linalg.norm(inferred_ca1)
-                norm2 = np.linalg.norm(stored_ca1)
-                if norm1 > 1e-10 and norm2 > 1e-10:
-                    similarity = float(np.dot(inferred_ca1, stored_ca1) / (norm1 * norm2))
-                else:
-                    similarity = 0.0
-                scores[stored_id] = similarity
-
+            scores = self._scores_from_inferred(inferred_ca1)
         else:
-            # Direct comparison with stored cortical patterns
-            for stored_id, stored_cortical, _ in self._cortical_associations:
-                # Cosine similarity
-                norm1 = np.linalg.norm(cortical_sdr)
-                norm2 = np.linalg.norm(stored_cortical)
-                if norm1 > 1e-10 and norm2 > 1e-10:
-                    similarity = float(np.dot(cortical_sdr, stored_cortical) / (norm1 * norm2))
-                else:
-                    similarity = 0.0
-                scores[stored_id] = similarity
+            scores = self._scores_from_cortical(cortical_sdr)
 
         if not scores:
             if return_scores:
                 return None, {}
             return None
 
-        best_id = max(scores.keys(), key=lambda k: scores[k])
+        # Best match by maximum score (dict.get used as value accessor)
+        best_id = max(scores, key=scores.get)
 
         if return_scores:
             return best_id, scores
         return best_id
 
     def get_top_hstate_matches(
-        self,
-        cortical_sdr: np.ndarray,
-        n: Optional[int] = None,
+            self,
+            cortical_sdr: np.ndarray,
+            n: Optional[int] = None,
     ) -> List[Tuple[str, float]]:
         """Get top N HState matches for a cortical SDR.
 
