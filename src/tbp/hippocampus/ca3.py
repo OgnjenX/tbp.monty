@@ -128,8 +128,11 @@ class CA3:
         >>> ca3.store(dg_pattern, spatial_event)
         >>> # Later, complete from partial cue
         >>> completed, retrieved_event = ca3.pattern_complete(partial_cue)
-        >>> # Predict future states
-        >>> future = ca3.predict_future(current_hstate, n_steps=5)
+        >>> # Predict future states by iterating the dynamics with `step()`
+        >>> future = [completed]
+        >>> for _ in range(5):
+        ...     next_p = ca3.step(future[-1])
+        ...     future.append(next_p)
     """
 
     def __init__(self, config: Optional[CA3Config] = None, seed: Optional[int] = None):
@@ -599,24 +602,6 @@ class CA3:
     def n_memories(self) -> int:
         """Number of stored memories."""
         return len(self._memories)
-
-    @property
-    def n_hstates(self) -> int:
-        """Number of stored HStates (deprecated; always 0 in CA3).
-
-        HStates are now managed at the Hippocampus/CA1 level.
-        """
-        return 0
-
-    @property
-    def hstates(self) -> List["HState"]:
-        """All stored HStates (deprecated; empty in CA3)."""
-        return []
-
-    @property
-    def current_hstate(self) -> Optional["HState"]:
-        """Current HState (now managed by Hippocampus; always None here)."""
-        return None
 
     @property
     def statistics(self) -> dict:
