@@ -48,6 +48,7 @@ class CA3Config:
         transition_learning_rate: Learning rate for transition graph updates.
         transition_decay: Decay factor for old transitions (0=no decay, 1=full decay).
         sr_gamma: Discount factor for multi-step SR predictions (0-1).
+        value_learning_rate: Learning rate for value/reward TD updates.
     """
 
     n_pyramidal_cells: int = 2500  # Scaled down from biological ~250k
@@ -63,6 +64,7 @@ class CA3Config:
     transition_learning_rate: float = 0.1
     transition_decay: float = 0.01
     sr_gamma: float = 0.9
+    value_learning_rate: float = 0.1
 
 
 @dataclass
@@ -96,11 +98,18 @@ class TransitionEntry:
         count: Number of times this transition was observed.
         recency: Timestamp of most recent occurrence.
         strength: Learned transition strength (decays over time).
+        expected_reward: Running estimate of immediate reward for this transition.
+        expected_return: Estimated discounted return from this transition.
+        is_synthetic: Whether this transition was created as a basis-derived
+            imagined shortcut rather than directly experienced.
     """
 
     count: int = 0
     recency: float = 0.0
     strength: float = 0.0
+    expected_reward: float = 0.0
+    expected_return: float = 0.0
+    is_synthetic: bool = False
 
 
 class CA3:
@@ -171,6 +180,10 @@ class CA3:
         self._total_stores = 0
         self._total_retrievals = 0
         self._successful_completions = 0
+
+        # Basis-aware shortcut configuration (for imagined transitions)
+        self.allow_basis_edges: bool = False
+        self.basis_threshold: float = 0.2
 
     def _create_sparse_mask(
             self, n: int, n_connections: int
@@ -560,6 +573,401 @@ class CA3:
 
         return paths
 
+    # ==================== Goal-Directed and Policy-Like Replay ====================
+
+    def _resolve_hstate(
+            self,
+            h: Union["HState", str],
+    ) -> Optional["HState"]:
+        """Helper to resolve HState or ID to HState instance."""
+        if isinstance(h, str):
+            return self._hstates.get(h)
+        return h
+
+    def score_path_by_goal_distance(
+            self,
+            path: List["HState"],
+            goal_hstate: "HState",
+    ) -> float:
+        """Score a path by how close it gets to the goal in basis space.
+
+        Higher is better (negative distance with length penalty).
+        """
+        if not path:
+            return float("-inf")
+        from .hstate import HState
+
+        assert isinstance(goal_hstate, HState)
+        last = path[-1]
+        dist = last.distance_to(goal_hstate, metric="basis")
+        # Encourage shorter paths slightly
+        length_penalty = 0.01 * (len(path) - 1)
+        return -dist - length_penalty
+
+    def score_path_by_transition_strength(self, path: List["HState"]) -> float:
+        """Score a path by cumulative transition strength."""
+        if len(path) < 2:
+            return 0.0
+
+        total_strength = 0.0
+        for a, b in zip(path[:-1], path[1:]):
+            from_id = a.id
+            to_id = b.id
+            entry = self._transitions.get(from_id, {}).get(to_id)
+            if entry is not None:
+                total_strength += float(entry.strength)
+        return total_strength
+
+    def score_path_combined(
+            self,
+            path: List["HState"],
+            goal_hstate: Optional["HState"] = None,
+            weights: Optional[Dict[str, float]] = None,
+    ) -> float:
+        """Combined scoring using distance, value, and transition strength.
+
+        Args:
+            path: List of HStates.
+            goal_hstate: Optional goal for distance-based term.
+            weights: Optional dictionary with keys 'distance', 'value',
+                and 'strength' controlling contribution of each term.
+
+        Returns:
+            Scalar score (higher is better).
+        """
+        if not path:
+            return float("-inf")
+
+        if weights is None:
+            weights = {"distance": 1.0, "value": 1.0, "strength": 0.5}
+
+        score = 0.0
+
+        # Distance-to-goal component (if goal provided)
+        if goal_hstate is not None and weights.get("distance", 0.0) != 0.0:
+            score += weights["distance"] * self.score_path_by_goal_distance(path, goal_hstate)
+
+        # Value component: terminal state value
+        if weights.get("value", 0.0) != 0.0:
+            terminal_value = float(path[-1].value)
+            score += weights["value"] * terminal_value
+
+        # Transition-strength component
+        if weights.get("strength", 0.0) != 0.0:
+            strength_score = self.score_path_by_transition_strength(path)
+            score += weights["strength"] * strength_score
+
+        return score
+
+    def _successor_ids(self, from_id: str) -> List[str]:
+        """Get successor IDs from transition graph (no basis shortcuts)."""
+        if from_id not in self._transitions:
+            return []
+        return list(self._transitions[from_id].keys())
+
+    def _basis_neighbors(
+            self,
+            from_id: str,
+            basis_threshold: float,
+            max_neighbors: int = 5,
+    ) -> List[str]:
+        """Find nearby HStates in basis space for imagined shortcuts."""
+        from .hstate import HState
+
+        if from_id not in self._hstates:
+            return []
+        source = self._hstates[from_id]
+        assert isinstance(source, HState)
+
+        distances: List[Tuple[str, float]] = []
+        for hid, hstate in self._hstates.items():
+            if hid == from_id:
+                continue
+            dist = source.distance_to(hstate, metric="basis")
+            if dist <= basis_threshold:
+                distances.append((hid, dist))
+
+        # Sort by distance and keep closest
+        distances.sort(key=lambda x: x[1])
+        return [hid for hid, _ in distances[:max_neighbors]]
+
+    def _ensure_synthetic_transition(
+            self,
+            from_id: str,
+            to_id: str,
+            base_strength: float = 0.01,
+    ) -> None:
+        """Create a synthetic transition if it does not exist."""
+        if from_id not in self._transitions:
+            self._transitions[from_id] = {}
+
+        if to_id not in self._transitions[from_id]:
+            self._transitions[from_id][to_id] = TransitionEntry(
+                strength=base_strength,
+                is_synthetic=True,
+            )
+        else:
+            entry = self._transitions[from_id][to_id]
+            if entry.strength < base_strength:
+                entry.strength = base_strength
+            entry.is_synthetic = True
+
+    def _successors_with_basis_shortcuts(
+            self,
+            from_id: str,
+            allow_basis_edges: bool,
+            basis_threshold: float,
+    ) -> List[str]:
+        """Get successors, optionally augmenting with basis-derived shortcuts."""
+        successors = self._successor_ids(from_id)
+
+        if not allow_basis_edges:
+            return successors
+
+        # If no successors, augment using basis neighbors
+        if not successors:
+            neighbors = self._basis_neighbors(from_id, basis_threshold=basis_threshold)
+            for nid in neighbors:
+                self._ensure_synthetic_transition(from_id, nid)
+            successors = self._successor_ids(from_id)
+
+        return successors
+
+    def replay_toward_goal(
+            self,
+            start_hstate: Union["HState", str],
+            goal_hstate: Union["HState", str],
+            max_paths: int = 5,
+            max_len: int = 12,
+            mode: str = "value",
+            allow_basis_edges: Optional[bool] = None,
+            basis_threshold: Optional[float] = None,
+    ) -> List[List["HState"]]:
+        """Goal-directed replay using graph search.
+
+        Args:
+            start_hstate: Starting HState or ID.
+            goal_hstate: Goal HState or ID.
+            max_paths: Maximum number of paths to return.
+            max_len: Maximum path length (number of states).
+            mode: Scoring mode, one of:
+                - 'value': prefer high-value trajectories
+                - 'distance': prefer trajectories closer to goal in basis space
+                - 'softmax': sample paths using softmax over combined scores
+            allow_basis_edges: Whether to use basis-derived imagined shortcuts.
+                Defaults to CA3.allow_basis_edges.
+            basis_threshold: Basis distance threshold for shortcuts. Defaults
+                to CA3.basis_threshold.
+
+        Returns:
+            Ranked list of candidate trajectories (each a list of HStates).
+        """
+        start = self._resolve_hstate(start_hstate)
+        goal = self._resolve_hstate(goal_hstate)
+        if start is None or goal is None:
+            return []
+
+        if allow_basis_edges is None:
+            allow_basis_edges = self.allow_basis_edges
+        if basis_threshold is None:
+            basis_threshold = self.basis_threshold
+
+        # Beam search with simple scoring heuristic
+        from heapq import heappush, heappop
+
+        def path_heuristic(path: List["HState"]) -> float:
+            if mode == "distance":
+                return -self.score_path_by_goal_distance(path, goal)
+            elif mode == "value":
+                # Negative because heapq is min-heap
+                return -self.score_path_combined(path, goal, weights={"distance": 0.5, "value": 1.0, "strength": 0.5})
+            elif mode == "softmax":
+                # Use same combined score as base heuristic
+                return -self.score_path_combined(path, goal)
+            # Default to combined scoring
+            return -self.score_path_combined(path, goal)
+
+        start_id = start.id
+        goal_id = goal.id
+
+        frontier: List[Tuple[float, List[str]]] = []
+        heappush(frontier, (0.0, [start_id]))
+        visited_paths: set = set()
+        candidate_paths: List[List["HState"]] = []
+
+        while frontier and len(candidate_paths) < max_paths:
+            _, path_ids = heappop(frontier)
+            current_id = path_ids[-1]
+
+            if (tuple(path_ids)) in visited_paths:
+                continue
+            visited_paths.add(tuple(path_ids))
+
+            if current_id == goal_id:
+                h_path = [self._hstates[hid] for hid in path_ids if hid in self._hstates]
+                if len(h_path) == len(path_ids):
+                    candidate_paths.append(h_path)
+                continue
+
+            if len(path_ids) >= max_len:
+                continue
+
+            successors = self._successors_with_basis_shortcuts(
+                current_id,
+                allow_basis_edges=allow_basis_edges,
+                basis_threshold=basis_threshold,
+            )
+
+            for succ_id in successors:
+                if succ_id in path_ids:
+                    continue  # Avoid cycles
+                new_path_ids = path_ids + [succ_id]
+                h_path = [self._hstates[hid] for hid in new_path_ids if hid in self._hstates]
+                if len(h_path) != len(new_path_ids):
+                    continue
+                h_score = path_heuristic(h_path)
+                heappush(frontier, (h_score, new_path_ids))
+
+        # Final scoring and ranking
+        if not candidate_paths:
+            return []
+
+        if mode == "softmax":
+            # Softmax sampling over combined scores
+            scores = [self.score_path_combined(p, goal) for p in candidate_paths]
+            scores_arr = np.array(scores, dtype=np.float64)
+            # Numerical stability
+            scores_arr = scores_arr - np.max(scores_arr)
+            probs = np.exp(scores_arr)
+            total = probs.sum()
+            if total > 1e-8:
+                probs /= total
+                # Sample without replacement according to probs order
+                indices = np.argsort(-probs)
+                return [candidate_paths[i] for i in indices]
+
+        # For 'value' and 'distance', sort by combined score
+        candidate_paths.sort(
+            key=lambda p: self.score_path_combined(
+                p,
+                goal,
+                weights={"distance": 1.0 if mode == "distance" else 0.5,
+                         "value": 1.0,
+                         "strength": 0.5},
+            ),
+            reverse=True,
+        )
+        return candidate_paths
+
+    def replay_policy_paths(
+            self,
+            start: Union["HState", str],
+            goal: Optional[Union["HState", str]] = None,
+            n_paths: int = 5,
+            max_len: int = 12,
+            temperature: float = 1.0,
+    ) -> List[List["HState"]]:
+        """Policy-like replay that prefers high-value/goal-directed paths.
+
+        If a goal is provided, this delegates to replay_toward_goal and then
+        optionally applies a softmax temperature to the ranking. If no goal
+        is provided, it explores forward from the start state, preferring
+        high-value successors.
+        """
+        start_h = self._resolve_hstate(start)
+        if start_h is None:
+            return []
+
+        if goal is not None:
+            paths = self.replay_toward_goal(
+                start_h,
+                goal,
+                max_paths=n_paths,
+                max_len=max_len,
+                mode="value",
+            )
+            if not paths:
+                return []
+
+            if temperature <= 0.0 or len(paths) == 1:
+                return paths
+
+            # Softmax reweighting over combined scores.
+            # Clamp very small temperatures to avoid numerical overflow
+            # when dividing scores by a near-zero value.
+            temp = max(temperature, 1e-3)
+
+            scores = np.array(
+                [self.score_path_combined(p, self._resolve_hstate(goal)) for p in paths],
+                dtype=np.float64,
+            )
+            scores = scores / temp
+            scores = scores - np.max(scores)
+            probs = np.exp(scores)
+            total = probs.sum()
+            if total <= 1e-8:
+                return paths
+            probs /= total
+            indices = np.argsort(-probs)
+            return [paths[i] for i in indices]
+
+        # No explicit goal: explore locally using value and transition strength
+        from heapq import heappush, heappop
+
+        def heuristic(path: List["HState"]) -> float:
+            return -self.score_path_combined(path, goal_hstate=None)
+
+        start_id = start_h.id
+        frontier: List[Tuple[float, List[str]]] = []
+        heappush(frontier, (0.0, [start_id]))
+        visited_paths: set = set()
+        candidate_paths: List[List["HState"]] = []
+
+        while frontier and len(candidate_paths) < n_paths:
+            _, path_ids = heappop(frontier)
+            current_id = path_ids[-1]
+
+            if tuple(path_ids) in visited_paths:
+                continue
+            visited_paths.add(tuple(path_ids))
+
+            h_path = [self._hstates[hid] for hid in path_ids if hid in self._hstates]
+            if len(h_path) == len(path_ids):
+                candidate_paths.append(h_path)
+
+            if len(path_ids) >= max_len:
+                continue
+
+            successors = self._successors_with_basis_shortcuts(
+                current_id,
+                allow_basis_edges=self.allow_basis_edges,
+                basis_threshold=self.basis_threshold,
+            )
+
+            for succ_id in successors:
+                if succ_id in path_ids:
+                    continue
+                new_ids = path_ids + [succ_id]
+                new_path = [self._hstates[hid] for hid in new_ids if hid in self._hstates]
+                if len(new_path) != len(new_ids):
+                    continue
+                h_score = heuristic(new_path)
+                heappush(frontier, (h_score, new_ids))
+
+        if not candidate_paths:
+            return []
+
+        # Rank by combined score (value + strength only)
+        candidate_paths.sort(
+            key=lambda p: self.score_path_combined(
+                p,
+                goal_hstate=None,
+                weights={"distance": 0.0, "value": 1.0, "strength": 0.5},
+            ),
+            reverse=True,
+        )
+        return candidate_paths[:n_paths]
+
     def _try_add_path(
             self,
             current_id: str,
@@ -718,6 +1126,11 @@ class CA3:
         return len(self._hstates)
 
     @property
+    def hstates(self) -> List["HState"]:
+        """All stored HStates."""
+        return list(self._hstates.values())
+
+    @property
     def n_transitions(self) -> int:
         """Total number of learned transitions."""
         return sum(len(targets) for targets in self._transitions.values())
@@ -763,6 +1176,76 @@ class CA3:
         self._total_stores = 0
         self._total_retrievals = 0
         self._successful_completions = 0
+
+        # Reset basis-aware shortcut configuration to defaults
+        self.allow_basis_edges = False
+        self.basis_threshold = 0.2
+
+    # ==================== Value / Reward Updates ====================
+
+    def update_hstate_value(self, hstate_id: str, value: float) -> None:
+        """Update the estimated value of an HState.
+
+        Uses a simple running update with value_learning_rate to keep
+        changes smooth and avoid abrupt jumps. If the HState does not
+        exist, this is a no-op.
+        """
+        from .hstate import HState
+
+        hstate = self._hstates.get(hstate_id)
+        if hstate is None:
+            return
+
+        lr = self.config.value_learning_rate
+        # Type narrowing for static checkers
+        assert isinstance(hstate, HState)
+        hstate.value = (1.0 - lr) * hstate.value + lr * float(value)
+
+    def update_transition_reward(
+            self,
+            from_hstate_id: str,
+            to_hstate_id: str,
+            reward: float,
+    ) -> None:
+        """Update reward statistics for a transition and propagate value.
+
+        This performs:
+        1. Running-average update of expected_reward on the transition
+        2. TD-style update of expected_return on the transition
+        3. TD-style value update on the source HState
+
+        If the transition does not yet exist, it will be created with
+        zero strength via register_transition (non-disruptive).
+        """
+        # Ensure transition entry exists
+        if from_hstate_id not in self._transitions or \
+                to_hstate_id not in self._transitions.get(from_hstate_id, {}):
+            # Create with minimal weight so it does not dominate structure
+            self.register_transition(from_hstate_id, to_hstate_id, weight=1e-8)
+
+        entry = self._transitions[from_hstate_id][to_hstate_id]
+        lr = self.config.value_learning_rate
+        gamma = self.config.sr_gamma
+
+        # Running average for immediate reward
+        entry.expected_reward = (
+                (1.0 - lr) * entry.expected_reward + lr * float(reward)
+        )
+
+        # TD update for expected return
+        next_value = 0.0
+        if to_hstate_id in self._hstates:
+            next_value = float(self._hstates[to_hstate_id].value)
+        td_target = float(reward) + gamma * next_value
+        entry.expected_return = (
+                (1.0 - lr) * entry.expected_return + lr * td_target
+        )
+
+        # TD update for source-state value
+        if from_hstate_id in self._hstates:
+            source = self._hstates[from_hstate_id]
+            td_error = td_target - source.value
+            source.value += lr * td_error
 
     # ==================== HState Encoding ====================
 

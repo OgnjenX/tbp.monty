@@ -275,6 +275,28 @@ class Hippocampus:
         """
         return self.ca3.get_hstate_by_id(hstate_id)
 
+    def update_hstate_value(self, hstate_id: str, value: float) -> None:
+        """Update the estimated value of an HState.
+
+        Delegates to CA3.update_hstate_value and is safe to call even if
+        the HState does not exist (no-op in that case).
+        """
+        self.ca3.update_hstate_value(hstate_id, value)
+
+    def update_transition_reward(
+            self,
+            src_id: str,
+            dst_id: str,
+            reward: float,
+    ) -> None:
+        """Update reward statistics for a transition in CA3.
+
+        This will create the transition entry if it does not exist and
+        perform TD-style updates of expected_reward/expected_return and
+        source-state value.
+        """
+        self.ca3.update_transition_reward(src_id, dst_id, reward)
+
     # ==================== Relational Queries ====================
 
     def predict_next_hstates(
@@ -421,7 +443,7 @@ class Hippocampus:
             List of matching HStates.
         """
         return [
-            hstate for hstate in self.ca3._hstates.values()
+            hstate for hstate in self.ca3.hstates
             if hstate.context_tag == context_tag
         ]
 
@@ -480,7 +502,7 @@ class Hippocampus:
         """
         matches: List[Tuple[HState, float]] = []
 
-        for hstate in self.ca3._hstates.values():
+        for hstate in self.ca3.hstates:
             if hstate.is_spatial:
                 assert hstate.spatial_location is not None
                 dist = float(np.linalg.norm(hstate.spatial_location - location))
@@ -551,6 +573,106 @@ class Hippocampus:
             List of possible paths between the states.
         """
         return self.ca3.replay_recombine(hstate_a, hstate_b, max_path_length)
+
+    def plan(
+            self,
+            start_hstate_id: str,
+            goal_descriptor: Union[str, HState, np.ndarray, Dict[str, Any]],
+            n_candidates: int = 5,
+            max_len: int = 12,
+    ) -> List[List[HState]]:
+        """High-level planning API using hippocampal replay.
+
+        Args:
+            start_hstate_id: ID of the starting HState.
+            goal_descriptor: Goal specification, which may be:
+                - HState ID (string)
+                - HState instance
+                - Basis vector target (np.ndarray with basis.output_dim)
+                - Spatial coordinates (np.ndarray of length 3)
+                - Dict with keys describing goal ('hstate_id', 'basis_vector',
+                  or 'location').
+            n_candidates: Number of candidate trajectories to return.
+            max_len: Maximum length of each trajectory.
+
+        Returns:
+            Ranked list of trajectories (best first), each a list of HStates.
+        """
+        start_hstate = self.get_hstate(start_hstate_id)
+        if start_hstate is None:
+            return []
+
+        goal_hstate = self._resolve_goal_descriptor(goal_descriptor)
+        if goal_hstate is None:
+            return []
+
+        paths = self.ca3.replay_policy_paths(
+            start=start_hstate,
+            goal=goal_hstate,
+            n_paths=n_candidates,
+            max_len=max_len,
+        )
+        return paths
+
+    def _resolve_goal_descriptor(
+            self,
+            goal_descriptor: Union[str, HState, np.ndarray, Dict[str, Any]],
+    ) -> Optional[HState]:
+        """Resolve various goal descriptor formats to a concrete HState.
+
+        The resolution strategy:
+        - If string: treat as HState ID.
+        - If HState: return as-is.
+        - If dict: check keys 'hstate_id', 'basis_vector', 'location'.
+        - If np.ndarray: treat as basis_vector if dimension matches,
+          otherwise treat as spatial coordinates (length 3).
+        """
+        # Direct HState or ID
+        if isinstance(goal_descriptor, HState):
+            return goal_descriptor
+        if isinstance(goal_descriptor, str):
+            return self.get_hstate(goal_descriptor)
+
+        # Dict-based descriptor
+        if isinstance(goal_descriptor, dict):
+            if "hstate_id" in goal_descriptor:
+                return self.get_hstate(str(goal_descriptor["hstate_id"]))
+            if "basis_vector" in goal_descriptor:
+                vec = np.asarray(goal_descriptor["basis_vector"], dtype=np.float64)
+                return self._nearest_hstate_in_basis(vec)
+            if "location" in goal_descriptor:
+                loc = np.asarray(goal_descriptor["location"], dtype=np.float64)
+                basis_vec = self.basis.encode(loc)
+                return self._nearest_hstate_in_basis(basis_vec)
+
+        # Numpy array or sequence: basis vector or coordinates
+        arr = np.asarray(goal_descriptor, dtype=np.float64)
+        if arr.ndim == 1:
+            if not hasattr(self.basis, "output_dim"):
+                raise ValueError("Cannot resolve goal descriptor: self.basis is missing 'output_dim' attribute, so cannot determine if input is a basis vector or coordinates.")
+            if arr.shape[0] == self.basis.output_dim:
+                # Interpret as basis vector
+                return self._nearest_hstate_in_basis(arr)
+            if arr.shape[0] == 3:
+                # Interpret as spatial coordinates
+                basis_vec = self.basis.encode(arr)
+                return self._nearest_hstate_in_basis(basis_vec)
+
+        return None
+
+    def _nearest_hstate_in_basis(self, target_basis: np.ndarray) -> Optional[HState]:
+        """Find the stored HState whose basis_vector is closest to target."""
+        target = np.asarray(target_basis, dtype=np.float64)
+        best_hstate: Optional[HState] = None
+        best_dist = float("inf")
+
+        for hstate in self.ca3.hstates:
+            dist = float(np.linalg.norm(hstate.basis_vector - target))
+            if dist < best_dist:
+                best_dist = dist
+                best_hstate = hstate
+
+        return best_hstate
 
     def _automatic_replay(self) -> None:
         """Perform automatic replay for consolidation."""

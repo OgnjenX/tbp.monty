@@ -61,6 +61,8 @@ class HState:
         ca3_pattern_hash: Tuple of active indices in CA3 pattern (hashable).
         basis_vector: EC basis code embedding (grid-like, generalizable).
             Shape depends on basis encoding used.
+        reward: Immediate reward associated with this state (if any).
+        value: Estimated long-term value (used for planning/policy replay).
         timestamp: Unix timestamp when this state was created.
         sequence_index: Position in current sequence (0-indexed). None if not
             part of a sequence.
@@ -87,6 +89,8 @@ class HState:
     ca3_pattern_hash: Tuple[int, ...]
     basis_vector: np.ndarray
     timestamp: float
+    reward: float = 0.0
+    value: float = 0.0
     sequence_index: Optional[int] = None
     spatial_location: Optional[np.ndarray] = None
     spatial_orientation: Optional[np.ndarray] = None
@@ -301,6 +305,8 @@ class HState:
             "ca3_pattern_hash": list(self.ca3_pattern_hash),
             "basis_vector": self.basis_vector.tolist(),
             "timestamp": self.timestamp,
+            "reward": self.reward,
+            "value": self.value,
             "sequence_index": self.sequence_index,
             "context_tag": self.context_tag,
             "confidence": self.confidence,
@@ -338,6 +344,8 @@ class HState:
             ca3_pattern_hash=tuple(data["ca3_pattern_hash"]),
             basis_vector=np.array(data["basis_vector"]),
             timestamp=data["timestamp"],
+            reward=data.get("reward", 0.0),
+            value=data.get("value", 0.0),
             sequence_index=data.get("sequence_index"),
             spatial_location=spatial_location,
             spatial_orientation=spatial_orientation,
