@@ -17,12 +17,13 @@ compatible with:
 Each HState corresponds to a CA3 attractor pattern and can encode ANY
 relational context, not just spatial locations.
 
-Key concepts:
-- HState is separate from SpatialEvent (input) and raw cortical SDRs (output)
-- Each HState has a unique ID derived from its CA3 pattern hash
-- HState can optionally reference spatial coordinates OR abstract context
-- EC basis codes (grid-like embeddings) are stored for generalization
-- Timestamps and sequence indices support temporal ordering
+    Key concepts:
+    - HState is separate from SpatialEvent (input) and raw cortical SDRs (output)
+    - Each HState has a unique ID derived from its DG/CA3 SDR indices
+    - HState can optionally reference spatial coordinates OR abstract context
+    - EC basis codes (grid-like embeddings) and CA1 SDRs are stored for
+      generalization and decoding
+    - Timestamps and sequence indices support temporal ordering
 
 Example:
     >>> # Create an HState from CA3 encoding
@@ -57,12 +58,13 @@ class HState:
     relational reasoning.
 
     Attributes:
-        id: Unique identifier (hash of CA3 pattern). Read-only after creation.
-        ca3_pattern_hash: Tuple of active indices in CA3 pattern (hashable).
-        basis_vector: EC basis code embedding (grid-like, generalizable).
-            Shape depends on basis encoding used.
-        reward: Immediate reward associated with this state (if any).
-        value: Estimated long-term value (used for planning/policy replay).
+        id: Unique identifier (hash of DG SDR indices). Read-only after creation.
+        sdr_indices: Tuple of active indices in the sparse distributed
+            representation from DG (primary code).
+        ca1_indices: Optional tuple of active indices in the CA1 SDR used as
+            decoded/clean readout for replay and planning.
+        basis_vector: Optional EC basis code embedding (grid-like) used for
+            interpolation/debugging, not required for core dynamics.
         timestamp: Unix timestamp when this state was created.
         sequence_index: Position in current sequence (0-indexed). None if not
             part of a sequence.
@@ -78,7 +80,8 @@ class HState:
 
     Example:
         >>> hstate = HState(
-        ...     ca3_pattern_hash=(10, 25, 47, 89, 156),
+        ...     sdr_indices=(10, 25, 47, 89, 156),
+        ...     ca1_indices=(5, 12, 89),
         ...     basis_vector=np.random.randn(64),
         ...     timestamp=time.time(),
         ...     spatial_location=np.array([1.0, 2.0, 0.5]),
@@ -86,11 +89,13 @@ class HState:
         ... )
     """
 
-    ca3_pattern_hash: Tuple[int, ...]
-    basis_vector: np.ndarray
+    # Primary internal representation: sparse DG SDR indices
+    sdr_indices: Tuple[int, ...]
     timestamp: float
-    reward: float = 0.0
-    value: float = 0.0
+    # Optional CA1 SDR indices (decoded / clean state)
+    ca1_indices: Optional[Tuple[int, ...]] = None
+    # Optional dense basis embedding for debugging/interpolation
+    basis_vector: Optional[np.ndarray] = None
     sequence_index: Optional[int] = None
     spatial_location: Optional[np.ndarray] = None
     spatial_orientation: Optional[np.ndarray] = None
@@ -104,8 +109,9 @@ class HState:
 
     def __post_init__(self):
         """Validate and compute derived fields."""
-        # Convert basis_vector to numpy array
-        self.basis_vector = np.asarray(self.basis_vector, dtype=np.float64)
+        # Convert basis_vector to numpy array if provided
+        if self.basis_vector is not None:
+            self.basis_vector = np.asarray(self.basis_vector, dtype=np.float64)
 
         # Validate spatial arrays if provided
         if self.spatial_location is not None:
@@ -127,11 +133,11 @@ class HState:
         self._id = self._compute_id()
 
     def _compute_id(self) -> str:
-        """Compute unique ID from CA3 pattern hash.
+        """Compute unique ID from SDR indices (pattern hash).
 
-        Uses SHA-256 hash of pattern indices for collision resistance.
+        Uses SHA-256 hash of indices for collision resistance.
         """
-        pattern_bytes = str(self.ca3_pattern_hash).encode("utf-8")
+        pattern_bytes = str(self.sdr_indices).encode("utf-8")
         return hashlib.sha256(pattern_bytes).hexdigest()[:16]
 
     @property
@@ -153,14 +159,14 @@ class HState:
 
     @property
     def n_active_cells(self) -> int:
-        """Number of active cells in the CA3 pattern."""
-        return len(self.ca3_pattern_hash)
+        """Number of active cells in the SDR."""
+        return len(self.sdr_indices)
 
     @classmethod
     def from_ca3_pattern(
             cls,
             ca3_pattern: np.ndarray,
-            basis_vector: np.ndarray,
+            basis_vector: Optional[np.ndarray],
             timestamp: float,
             threshold: float = 0.5,
             **kwargs,
@@ -168,8 +174,8 @@ class HState:
         """Create HState from a CA3 pattern array.
 
         Args:
-            ca3_pattern: Full CA3 pattern array (can be binary or continuous).
-            basis_vector: EC basis code embedding.
+            ca3_pattern: Full SDR pattern array (binary or continuous).
+            basis_vector: Optional EC basis code embedding.
             timestamp: Unix timestamp for this state.
             threshold: Threshold for considering a cell active (default 0.5).
             **kwargs: Additional arguments passed to HState constructor.
@@ -178,10 +184,10 @@ class HState:
             New HState instance.
         """
         active_indices = np.where(ca3_pattern > threshold)[0]
-        ca3_pattern_hash = tuple(active_indices.tolist())
+        sdr_indices = tuple(active_indices.tolist())
 
         return cls(
-            ca3_pattern_hash=ca3_pattern_hash,
+            sdr_indices=sdr_indices,
             basis_vector=basis_vector,
             timestamp=timestamp,
             **kwargs,
@@ -192,7 +198,7 @@ class HState:
             cls,
             event: SpatialEvent,
             ca3_pattern: np.ndarray,
-            basis_vector: np.ndarray,
+            basis_vector: Optional[np.ndarray],
             threshold: float = 0.5,
             context_tag: Optional[str] = None,
     ) -> HState:
@@ -200,8 +206,8 @@ class HState:
 
         Args:
             event: Source SpatialEvent.
-            ca3_pattern: CA3 pattern array encoding this event.
-            basis_vector: EC basis code embedding.
+            ca3_pattern: SDR pattern array encoding this event (DG or CA3).
+            basis_vector: Optional EC basis code embedding.
             threshold: Threshold for considering a cell active.
             context_tag: Optional context identifier.
 
@@ -220,8 +226,38 @@ class HState:
             context_tag=context_tag,
         )
 
+    @classmethod
+    def from_dg_ca1(
+            cls,
+            event: SpatialEvent,
+            dg_sdr: np.ndarray,
+            ca1_sdr: np.ndarray,
+            basis_vector: Optional[np.ndarray],
+            threshold: float = 0.5,
+            context_tag: Optional[str] = None,
+    ) -> HState:
+        """Create HState from DG and CA1 SDR patterns plus basis embedding.
+
+        DG SDR provides the primary internal state; CA1 SDR captures the
+        decoded/clean readout used for replay and planning.
+        """
+        dg_active = np.where(dg_sdr > threshold)[0]
+        ca1_active = np.where(ca1_sdr > threshold)[0]
+
+        return cls(
+            sdr_indices=tuple(dg_active.tolist()),
+            ca1_indices=tuple(ca1_active.tolist()),
+            basis_vector=basis_vector,
+            timestamp=event.timestamp,
+            spatial_location=event.location.copy(),
+            spatial_orientation=event.orientation.copy(),
+            source_event=event,
+            confidence=event.confidence,
+            context_tag=context_tag,
+        )
+
     def to_pattern(self, n_cells: int) -> np.ndarray:
-        """Reconstruct binary CA3 pattern from hash.
+        """Reconstruct binary DG SDR pattern from stored indices.
 
         Args:
             n_cells: Total number of CA3 cells.
@@ -230,7 +266,24 @@ class HState:
             Binary pattern array of shape (n_cells,).
         """
         pattern = np.zeros(n_cells, dtype=np.float32)
-        for idx in self.ca3_pattern_hash:
+        for idx in self.sdr_indices:
+            if 0 <= idx < n_cells:
+                pattern[idx] = 1.0
+        return pattern
+
+    def to_ca1_pattern(self, n_cells: int) -> np.ndarray:
+        """Reconstruct binary CA1 SDR pattern from stored CA1 indices.
+
+        Args:
+            n_cells: Total number of CA1 cells.
+
+        Returns:
+            Binary pattern array of shape (n_cells,).
+        """
+        pattern = np.zeros(n_cells, dtype=np.float32)
+        if self.ca1_indices is None:
+            return pattern
+        for idx in self.ca1_indices:
             if 0 <= idx < n_cells:
                 pattern[idx] = 1.0
         return pattern
@@ -252,12 +305,14 @@ class HState:
             ValueError: If metric is "spatial" but one state is not spatial.
         """
         if metric == "basis":
+            if self.basis_vector is None or other.basis_vector is None:
+                raise ValueError("Both states must have basis_vector for 'basis' metric")
             return float(np.linalg.norm(self.basis_vector - other.basis_vector))
 
         elif metric == "pattern":
             # Hamming distance (symmetric difference of active indices)
-            self_set = set(self.ca3_pattern_hash)
-            other_set = set(other.ca3_pattern_hash)
+            self_set = set(self.sdr_indices)
+            other_set = set(other.sdr_indices)
             symmetric_diff = self_set.symmetric_difference(other_set)
             return float(len(symmetric_diff))
 
@@ -275,7 +330,7 @@ class HState:
     def overlap_with(self, other: HState) -> float:
         """Compute pattern overlap with another HState.
 
-        Uses Jaccard similarity of active CA3 indices.
+        Uses Jaccard similarity of active SDR indices.
 
         Args:
             other: Another HState to compare.
@@ -283,8 +338,8 @@ class HState:
         Returns:
             Overlap score [0, 1] where 1 = identical patterns.
         """
-        self_set = set(self.ca3_pattern_hash)
-        other_set = set(other.ca3_pattern_hash)
+        self_set = set(self.sdr_indices)
+        other_set = set(other.sdr_indices)
 
         if not self_set and not other_set:
             return 1.0  # Both empty = identical
@@ -302,11 +357,10 @@ class HState:
         """
         result = {
             "id": self.id,
-            "ca3_pattern_hash": list(self.ca3_pattern_hash),
-            "basis_vector": self.basis_vector.tolist(),
+            "sdr_indices": list(self.sdr_indices),
+            "ca1_indices": list(self.ca1_indices) if self.ca1_indices is not None else None,
+            "basis_vector": self.basis_vector.tolist() if self.basis_vector is not None else None,
             "timestamp": self.timestamp,
-            "reward": self.reward,
-            "value": self.value,
             "sequence_index": self.sequence_index,
             "context_tag": self.context_tag,
             "confidence": self.confidence,
@@ -340,12 +394,19 @@ class HState:
         if "spatial_orientation" in data:
             spatial_orientation = np.array(data["spatial_orientation"])
 
+        basis_vec = None
+        if "basis_vector" in data and data["basis_vector"] is not None:
+            basis_vec = np.array(data["basis_vector"])
+
+        ca1_indices: Optional[Tuple[int, ...]] = None
+        if "ca1_indices" in data and data["ca1_indices"] is not None:
+            ca1_indices = tuple(data["ca1_indices"])
+
         return cls(
-            ca3_pattern_hash=tuple(data["ca3_pattern_hash"]),
-            basis_vector=np.array(data["basis_vector"]),
+            sdr_indices=tuple(data["sdr_indices"]),
+            ca1_indices=ca1_indices,
+            basis_vector=basis_vec,
             timestamp=data["timestamp"],
-            reward=data.get("reward", 0.0),
-            value=data.get("value", 0.0),
             sequence_index=data.get("sequence_index"),
             spatial_location=spatial_location,
             spatial_orientation=spatial_orientation,
@@ -355,14 +416,14 @@ class HState:
         )
 
     def __hash__(self) -> int:
-        """Hash based on CA3 pattern (immutable part of identity)."""
-        return hash(self.ca3_pattern_hash)
+        """Hash based on SDR indices (immutable part of identity)."""
+        return hash(self.sdr_indices)
 
     def __eq__(self, other: object) -> bool:
-        """Equality based on CA3 pattern hash."""
+        """Equality based on SDR indices."""
         if not isinstance(other, HState):
             return NotImplemented
-        return self.ca3_pattern_hash == other.ca3_pattern_hash
+        return self.sdr_indices == other.sdr_indices
 
     def __repr__(self) -> str:
         spatial_info = f", loc={self.spatial_location}" if self.is_spatial else ""

@@ -43,7 +43,6 @@ class CA1Config:
         mismatch_learning_rate: Learning rate for mismatch-driven plasticity.
         temporal_window: Time window for sequence detection (seconds).
         ec_weight: Weight of EC input relative to CA3.
-        output_sparsity: Sparsity of output to subiculum.
         cortical_dim: Dimensionality of cortical SDR patterns.
         cortical_learning_rate: Learning rate for HState-cortical associations.
         cortical_sparsity: Sparsity level for predicted cortical patterns (0-1).
@@ -57,7 +56,6 @@ class CA1Config:
     mismatch_learning_rate: float = 0.15
     temporal_window: float = 1.0
     ec_weight: float = 0.5  # Balance between EC and CA3
-    output_sparsity: float = 0.02
     # Cortical mapping parameters
     cortical_dim: int = 2048  # Default SDR dimensionality
     cortical_learning_rate: float = 0.1
@@ -69,10 +67,6 @@ class CA1Config:
         if not 0 < self.cortical_sparsity < 1:
             raise ValueError(
                 f"cortical_sparsity must be in range (0, 1), got {self.cortical_sparsity}"
-            )
-        if not 0 < self.output_sparsity < 1:
-            raise ValueError(
-                f"output_sparsity must be in range (0, 1), got {self.output_sparsity}"
             )
 
 
@@ -317,7 +311,7 @@ class CA1:
         return np.tanh(np.dot(self._ec_weights, pattern))
 
     def _apply_sparsity(self, pattern: np.ndarray) -> np.ndarray:
-        """Apply sparsity constraint to output pattern.
+        """Apply sparsity constraint to output pattern (k-WTA style).
 
         Args:
             pattern: Dense activation pattern.
@@ -326,13 +320,64 @@ class CA1:
             Sparse binary output pattern.
         """
         # Winner-take-all: keep top n_active activations
-        if np.any(pattern > 0):
-            threshold = np.percentile(pattern[pattern > 0], 100 * (1 - self.config.output_sparsity))
-            output = (pattern > threshold).astype(np.float32)
-        else:
-            output = np.zeros_like(pattern)
+        if not np.any(pattern):
+            return np.zeros_like(pattern)
 
-        return output
+        k = max(1, self.config.n_active_cells)
+        flat = pattern.ravel()
+        if k >= flat.size:
+            return (flat > 0).astype(np.float32).reshape(pattern.shape)
+
+        idx = np.argpartition(flat, -k)[-k:]
+        output = np.zeros_like(flat, dtype=np.float32)
+        output[idx] = 1.0
+        return output.reshape(pattern.shape)
+
+    # ==================== Comparator / Decoder ====================
+
+    def step(
+            self,
+            x_ca3: np.ndarray,
+            ec_input: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        """Single CA1 comparator step: integrate CA3 prediction and EC input.
+
+        Implements:
+            r_pred = W_ca3_to_ca1 @ x_CA3
+            r_sens = W_ec_to_ca1 @ ec_input
+            y = kWTA(r_pred + r_sens)
+        """
+        ca3_proj = self._project_ca3(x_ca3)
+        if ec_input is not None:
+            ec_proj = self._project_ec(ec_input)
+        else:
+            ec_proj = np.zeros_like(ca3_proj)
+
+        r = ca3_proj + ec_proj
+        return self._apply_sparsity(r)
+
+    def decode_to_hstate_id(self, x_ca1: np.ndarray) -> Optional[str]:
+        """Decode CA1 SDR back to a stored HState ID.
+
+        Uses nearest-neighbor matching in CA1 pattern space against
+        previously stored CA1 patterns from cortical associations.
+        Returns the best-matching HState ID, or None if no associations
+        exist yet.
+        """
+        if not self._cortical_associations:
+            return None
+
+        x = np.asarray(x_ca1, dtype=np.float32).ravel()
+        best_id: Optional[str] = None
+        best_sim = -1.0
+
+        for hstate_id, _, ca1_pattern in self._cortical_associations:
+            sim = _cosine_similarity(x, ca1_pattern)
+            if sim > best_sim:
+                best_sim = sim
+                best_id = hstate_id
+
+        return best_id
 
     def _mismatch_learning(
             self, ca3_input: np.ndarray, ec_input: np.ndarray
@@ -735,8 +780,8 @@ class CA1:
                 return None, {}
             return None
 
-        # Best match by maximum score (dict.get used as value accessor)
-        best_id = max(scores, key=scores.get)
+        # Best match by maximum score
+        best_id = max(scores, key=lambda hid: scores[hid])
 
         if return_scores:
             return best_id, scores

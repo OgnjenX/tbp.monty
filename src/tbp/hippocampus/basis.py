@@ -521,6 +521,8 @@ class CombinedBasis(BasisCode):
         Raises:
             ValueError: If required keys are missing.
         """
+        if self.names is None:
+            raise ValueError("Names must be provided to use dict input with semantic access")
         encodings = []
         for i, (basis, weight, name) in enumerate(zip(self.bases, self.weights, self.names)):
             if name not in input_data:

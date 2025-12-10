@@ -7,50 +7,52 @@
 """Hippocampus module - Universal Relational Map System.
 
 This package implements hippocampal computations for spatial and abstract
-relational learning, inspired by the Tolman-Eichenbaum Machine (TEM) and
-Successor Representation (SR) theories. The system maintains a latent state
-space (HState) and learns transition dynamics for prediction and navigation.
+relational learning, inspired by the Tolman–Eichenbaum Machine (TEM) and
+Successor Representation (SR) ideas. The system maintains a latent state
+space (HState) and learns transition dynamics via local Hebbian updates in
+recurrent networks, supporting prediction, replay, and planning.
 
 Key Concepts:
     HState: The core latent representation maintained by the hippocampus.
         Each HState captures the system's belief about "where it is" in a
         relational space (physical or abstract). HStates are identified by
-        CA3 pattern hashes and contain spatial/abstract context embeddings.
-
-    Transition Graph: CA3 maintains a directed graph of transitions between
-        HStates. This enables computing successor representations (SR) and
-        predicting future states given actions.
+        sparse distributed representations (SDRs) from DG (pattern separation)
+        together with decoded CA1 SDRs and optional basis embeddings.
 
     Basis Codes: Generalized spatial encoding via pluggable basis systems.
-        MetricGridBasis (default) uses grid cells for Euclidean space.
+        MetricGridBasis (default) uses grid-like codes for Euclidean space.
         PlaceBasis uses place cell population encoding.
         CombinedBasis combines multiple bases for hierarchical encoding.
-        You may implement your own BasisCode subclass for graph-based relational tasks.
+        You may implement your own BasisCode subclass for abstract spaces.
 
-    Observation Model: CA1 learns bidirectional mappings between HStates
-        and Monty cortical column SDRs, enabling perception-based localization
-        and imagination of sensory consequences.
+    Observation Model: CA1 compares CA3 predictions with EC/basis input and
+        produces a sparse output SDR that serves as the primary readout for
+        replay and planning. CA1 also learns bidirectional mappings between
+        HStates and cortical SDRs for perception-based localization and
+        imagination of sensory consequences.
 
 Components:
     Hippocampus: High-level API integrating all components. Provides:
         - encode_event(): Convert observations to HState
-        - predict_next_hstates(): One-step prediction
+        - predict_next_hstates(): One-step prediction via dynamics
         - predict_future_hstates(): Multi-step rollout
         - predict_cortical_future(): Predicted sensory SDRs
         - replay_*(): Replay for consolidation and planning
 
     Entorhinal Cortex (EC): Grid cells, place cells, spatial encoding.
-        Encodes continuous coordinates into SDR format for DG/CA3.
+        Encodes continuous coordinates into basis vectors for DG/CA3.
 
     Dentate Gyrus (DG): Pattern separation with ultra-sparse encoding.
-        Transforms EC input into orthogonalized patterns for CA3.
+        Transforms EC/basis input into orthogonalized SDRs for CA3.
 
-    CA3: Autoassociative memory with transition learning. Stores HStates,
-        learns transition probabilities, supports pattern completion and
-        successor representation computation.
+    CA3: Autoassociative recurrent network. Stores DG-evoked patterns and
+        learns temporal transitions directly in a recurrent weight matrix via
+        local Hebbian rules. Supports pattern completion and sequence replay
+        through attractor dynamics (no explicit transition graph).
 
-    CA1: Comparator between CA3 predictions and EC input. Also learns
-        cortical SDR associations for observation-based inference.
+    CA1: Comparator between CA3 predictions and EC/basis input. Implements
+        a k-WTA readout that integrates prediction and sensory drive, and
+        provides the canonical decoded SDR for HStates and planning.
 
     EpisodicMemory: Timestamped event buffer for temporal context.
 
@@ -89,8 +91,8 @@ Structure:
     tbp.hippocampus.basis         - Pluggable basis code system (EC generalization)
     tbp.hippocampus.entorhinal    - Entorhinal cortex implementation
     tbp.hippocampus.dentate_gyrus - Pattern separation (ultra-sparse coding)
-    tbp.hippocampus.ca3           - Autoassociative memory + transition graph
-    tbp.hippocampus.ca1           - Comparator network + cortical mapping
+    tbp.hippocampus.ca3           - Autoassociative recurrent network (DG→CA3 dynamics)
+    tbp.hippocampus.ca1           - Comparator / decoder + cortical mapping
     tbp.hippocampus.memory        - Episodic memory buffer
     tbp.hippocampus.hippocampus   - High-level integrated API
     tbp.hippocampus.adapters      - Integration adapters (e.g., MontyAdapter)
@@ -109,8 +111,8 @@ from tbp.hippocampus.basis import (
 )
 # CA1 (extended with cortical mapping)
 from tbp.hippocampus.ca1 import CA1, CA1Config, ComparisonResult
-# CA3 (extended with transition graph)
-from tbp.hippocampus.ca3 import CA3, CA3Config, CA3Memory, TransitionEntry
+# CA3 (recurrent attractor network)
+from tbp.hippocampus.ca3 import CA3, CA3Config, CA3Memory
 # Dentate Gyrus
 from tbp.hippocampus.dentate_gyrus import DentateGyrus, DGConfig
 # Entorhinal Cortex
@@ -152,7 +154,6 @@ __all__ = [
     "CA3",
     "CA3Config",
     "CA3Memory",
-    "TransitionEntry",
 
     # === CA1 (extended) ===
     "CA1",

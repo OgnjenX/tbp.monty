@@ -120,7 +120,7 @@ class Hippocampus:
         config: HippocampusConfig with system parameters.
         ec: EntorhinalCortex for spatial encoding.
         dg: DentateGyrus for pattern separation.
-        ca3: CA3 autoassociative memory with transition graph.
+        ca3: CA3 autoassociative memory with recurrent dynamics.
         ca1: CA1 comparator with cortical mapping.
         basis: BasisCode for encoding coordinates/features.
     """
@@ -138,13 +138,7 @@ class Hippocampus:
         """
         self.config = config or HippocampusConfig()
 
-        # Initialize components
-        self._init_ec()
-        self._init_dg()
-        self._init_ca3()
-        self._init_ca1()
-
-        # Initialize basis code
+        # Initialize basis code first so DG can use its dimensionality
         if basis is not None:
             self.basis = basis
         else:
@@ -153,12 +147,26 @@ class Hippocampus:
                 n_place_cells=self.config.n_place_cells,
             )
 
+        # Initialize components
+        self._init_ec()
+        self._init_dg()
+        self._init_ca3()
+        self._init_ca1()
+
         # Context tracking
         self._current_context: Optional[str] = self.config.context_tag
         self._context_history: List[str] = []
 
         # Step counter for replay scheduling
         self._step_count = 0
+
+        # HState storage and current state tracking (CA1-decoded)
+        self._hstates: Dict[str, HState] = {}
+        self._current_hstate_id: Optional[str] = None
+        # Optional per-HState scalar values for goal/value modulation
+        self._hstate_values: Dict[str, float] = {}
+        # Last CA3 pattern for simple transition learning
+        self._last_ca3_pattern: Optional[np.ndarray] = None
 
     def _init_ec(self) -> None:
         """Initialize Entorhinal Cortex."""
@@ -171,8 +179,9 @@ class Hippocampus:
 
     def _init_dg(self) -> None:
         """Initialize Dentate Gyrus."""
+        # Use basis encoder dimensionality as DG input space
         dg_config = DGConfig(
-            n_input=self.config.n_place_cells + self.config.n_grid_cells,
+            n_input=self.basis.output_dim,
             n_granule_cells=self.config.n_granule_cells,
             sparsity=self.config.dg_sparsity,
         )
@@ -222,35 +231,48 @@ class Hippocampus:
         self._step_count += 1
         ctx = context_tag or self._current_context
 
-        # 1. EC encoding
-        ec_activations = self.ec.receive_event(event)
-        ec_pattern = np.concatenate([
-            ec_activations["place_activations"],
-            ec_activations["grid_activations"],
-        ])
-
-        # 2. DG pattern separation
-        dg_output = self.dg.encode(ec_pattern)
-
-        # 3. Basis code encoding
+        # 1. Basis / EC encoding (universal coordinate embedding)
         basis_vector = self.basis.encode(event.location)
 
-        # 4. CA3 encoding to HState
-        hstate = self.ca3.encode_to_hstate(
-            dg_pattern=dg_output.sparse_code,
+        # 2. DG pattern separation from basis space (DG SDR)
+        dg_output = self.dg.encode(basis_vector)
+
+        # 3. CA3 encoding/learning from DG SDR
+        dg_sdr = dg_output.sparse_code
+        ca3_pattern = self.ca3._project_from_dg(dg_sdr)
+        # Autoassociative storage
+        self.ca3.store(dg_sdr, event, ca3_pattern=ca3_pattern)
+
+        # Simple Hebbian transition learning between successive CA3 patterns
+        if self._last_ca3_pattern is not None:
+            try:
+                self.ca3.learn_transition(self._last_ca3_pattern, ca3_pattern)
+            except ValueError:
+                pass
+        self._last_ca3_pattern = ca3_pattern.copy()
+
+        # 4. CA1 comparator/decoder: integrate CA3 prediction with EC basis
+        ca1_sdr = self.ca1.step(ca3_pattern, ec_input=basis_vector)
+
+        # 5. Create/update HState using DG SDR (primary) and CA1 SDR (decoded)
+        hstate = HState.from_dg_ca1(
             event=event,
+            dg_sdr=dg_sdr,
+            ca1_sdr=ca1_sdr,
             basis_vector=basis_vector,
             context_tag=ctx,
         )
+        self._hstates[hstate.id] = hstate
+        self._current_hstate_id = hstate.id
 
-        # 5. Optional cortical association via CA1
+        # 6. Optional cortical association via CA1 (cortical SDR mapping)
         if cortical_sdr is not None:
             self.ca1.learn_hstate_cortical_mapping(
                 hstate=hstate,
                 cortical_sdr=cortical_sdr,
             )
 
-        # 6. Periodic replay for consolidation
+        # 7. Periodic replay for consolidation
         if self.config.enable_replay and self._step_count % self.config.replay_interval == 0:
             self._automatic_replay()
 
@@ -262,7 +284,9 @@ class Hippocampus:
         Returns:
             Current HState, or None if no state has been encoded.
         """
-        return self.ca3.current_hstate
+        if self._current_hstate_id is None:
+            return None
+        return self._hstates.get(self._current_hstate_id)
 
     def get_hstate(self, hstate_id: str) -> Optional[HState]:
         """Get an HState by its ID.
@@ -273,29 +297,17 @@ class Hippocampus:
         Returns:
             HState if found, None otherwise.
         """
-        return self.ca3.get_hstate_by_id(hstate_id)
+        return self._hstates.get(hstate_id)
 
     def update_hstate_value(self, hstate_id: str, value: float) -> None:
         """Update the estimated value of an HState.
 
-        Delegates to CA3.update_hstate_value and is safe to call even if
-        the HState does not exist (no-op in that case).
+        Stores a scalar value used later for local value modulation
+        during replay/planning. Safe to call even if the HState does
+        not exist (no-op in that case).
         """
-        self.ca3.update_hstate_value(hstate_id, value)
-
-    def update_transition_reward(
-            self,
-            src_id: str,
-            dst_id: str,
-            reward: float,
-    ) -> None:
-        """Update reward statistics for a transition in CA3.
-
-        This will create the transition entry if it does not exist and
-        perform TD-style updates of expected_reward/expected_return and
-        source-state value.
-        """
-        self.ca3.update_transition_reward(src_id, dst_id, reward)
+        if hstate_id in self._hstates:
+            self._hstate_values[hstate_id] = float(value)
 
     # ==================== Relational Queries ====================
 
@@ -306,7 +318,8 @@ class Hippocampus:
     ) -> List[HState]:
         """Predict next likely HStates from current or specified state.
 
-        Uses the transition graph to predict successors.
+        Uses a single CA3 dynamic step from the starting state and reads
+        out the resulting attractor as a small set of candidate HStates.
 
         Args:
             n: Maximum number of predictions.
@@ -320,7 +333,9 @@ class Hippocampus:
             if from_hstate is None:
                 return []
 
-        return self.ca3.successors(from_hstate)[:n]
+        # One dynamic CA3 step followed by CA1 decoding.
+        trajectory = self.replay_forward(start_hstate=from_hstate, depth=1)
+        return trajectory[:n]
 
     def predict_future_hstates(
             self,
@@ -328,9 +343,7 @@ class Hippocampus:
             from_hstate: Optional[Union[HState, str]] = None,
             stochastic: bool = False,
     ) -> List[HState]:
-        """Predict future HStates over multiple steps.
-
-        Uses SR-style multi-step prediction.
+        """Predict future HStates over multiple steps using CA3 dynamics.
 
         Args:
             steps: Number of future steps to predict.
@@ -345,7 +358,8 @@ class Hippocampus:
             if from_hstate is None:
                 return []
 
-        return self.ca3.predict_future(from_hstate, n_steps=steps, stochastic=stochastic)
+        # Use forward replay as a multi-step dynamic rollout
+        return self.replay_forward(start_hstate=from_hstate, depth=steps)
 
     def predict_cortical_future(
             self,
@@ -373,45 +387,8 @@ class Hippocampus:
 
         return cortical_patterns
 
-    def transition_probabilities(
-            self,
-            from_hstate: Optional[Union[HState, str]] = None,
-    ) -> Dict[str, float]:
-        """Get transition probabilities from current or specified state.
-
-        Args:
-            from_hstate: Starting state. Uses current if None.
-
-        Returns:
-            Dictionary mapping HState IDs to transition probabilities.
-        """
-        if from_hstate is None:
-            from_hstate = self.current_hstate()
-            if from_hstate is None:
-                return {}
-
-        return self.ca3.transition_probability(from_hstate)
-
-    def compute_sr(
-            self,
-            from_hstate: Optional[Union[HState, str]] = None,
-            n_steps: int = 10,
-    ) -> np.ndarray:
-        """Compute Successor Representation vector.
-
-        Args:
-            from_hstate: Starting state. Uses current if None.
-            n_steps: Number of steps for SR computation.
-
-        Returns:
-            SR vector representing expected future state occupancy.
-        """
-        if from_hstate is None:
-            from_hstate = self.current_hstate()
-            if from_hstate is None:
-                return np.array([])
-
-        return self.ca3.compute_sr_vector(from_hstate, n_steps=n_steps)
+    # Transition probabilities and SR computation have been removed from the
+    # mechanistic API; temporal structure now lives entirely in CA3 dynamics.
 
     # ==================== Abstract Task Support ====================
 
@@ -443,7 +420,7 @@ class Hippocampus:
             List of matching HStates.
         """
         return [
-            hstate for hstate in self.ca3.hstates
+            hstate for hstate in self._hstates.values()
             if hstate.context_tag == context_tag
         ]
 
@@ -453,9 +430,11 @@ class Hippocampus:
             self,
             partial_pattern: np.ndarray,
     ) -> Optional[HState]:
-        """Retrieve HState from partial pattern cue.
+        """Retrieve HState from partial DG pattern cue (legacy helper).
 
-        Uses CA3 pattern completion.
+        Uses CA3 pattern completion followed by nearest HState lookup
+        in DG SDR space. This does not participate in replay/planning
+        dynamics and is kept as a convenience utility.
 
         Args:
             partial_pattern: Partial or noisy pattern.
@@ -463,7 +442,29 @@ class Hippocampus:
         Returns:
             Retrieved HState, or None if no match found.
         """
-        return self.ca3.retrieve_hstate(partial_pattern)
+        completed, _ = self.ca3.pattern_complete(partial_pattern, return_event=False)
+        if completed is None:
+            return None
+
+        # Match to stored HState by DG SDR overlap
+        best_h: Optional[HState] = None
+        best_overlap = 0.0
+        active = set(np.where(completed > 0.5)[0])
+
+        for h in self._hstates.values():
+            h_set = set(h.sdr_indices)
+            if not h_set:
+                continue
+            inter = len(active & h_set)
+            union = len(active | h_set)
+            if union == 0:
+                continue
+            overlap = inter / union
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_h = h
+
+        return best_h
 
     def retrieve_from_cortical(
             self,
@@ -483,7 +484,7 @@ class Hippocampus:
         if isinstance(hstate_id, tuple):
             hstate_id = hstate_id[0]
         if hstate_id is not None:
-            return self.ca3.get_hstate_by_id(hstate_id)
+            return self._hstates.get(hstate_id)
         return None
 
     def retrieve_from_location(
@@ -502,7 +503,7 @@ class Hippocampus:
         """
         matches: List[Tuple[HState, float]] = []
 
-        for hstate in self.ca3.hstates:
+        for hstate in self._hstates.values():
             if hstate.is_spatial:
                 assert hstate.spatial_location is not None
                 dist = float(np.linalg.norm(hstate.spatial_location - location))
@@ -529,11 +530,34 @@ class Hippocampus:
             List of replayed HStates.
         """
         if start_hstate is None:
-            start_hstate = self.current_hstate()
-            if start_hstate is None:
-                return []
+            start = self.current_hstate()
+        elif isinstance(start_hstate, HState):
+            start = start_hstate
+        else:
+            start = self.get_hstate(start_hstate)
 
-        return self.ca3.replay_forward(start_hstate, depth)
+        if start is None:
+            return []
+
+        # Derive initial CA3 pattern from stored DG SDR
+        dg_pattern = start.to_pattern(self.config.n_granule_cells)
+        x_ca3 = self.ca3._project_from_dg(dg_pattern)
+
+        trajectory: List[HState] = []
+
+        for _ in range(depth):
+            x_ca3 = self.ca3.step(x_ca3)
+            # CA1 comparator/decoder as exclusive readout
+            x_ca1 = self.ca1.step(x_ca3, ec_input=None)
+            h_next = self._decode_ca1_to_hstate(x_ca1)
+            if h_next is None:
+                break
+            # Avoid trivial immediate self-loops
+            if trajectory and h_next.id == trajectory[-1].id:
+                break
+            trajectory.append(h_next)
+
+        return trajectory
 
     def replay_backward(
             self,
@@ -550,11 +574,31 @@ class Hippocampus:
             List of predecessor HStates.
         """
         if end_hstate is None:
-            end_hstate = self.current_hstate()
-            if end_hstate is None:
-                return []
+            end = self.current_hstate()
+        elif isinstance(end_hstate, HState):
+            end = end_hstate
+        else:
+            end = self.get_hstate(end_hstate)
 
-        return self.ca3.replay_backward(end_hstate, depth)
+        if end is None:
+            return []
+
+        dg_pattern = end.to_pattern(self.config.n_granule_cells)
+        x_ca3 = self.ca3._project_from_dg(dg_pattern)
+
+        trajectory: List[HState] = []
+
+        for _ in range(depth):
+            x_ca3 = self.ca3.step(x_ca3, reverse=True)
+            x_ca1 = self.ca1.step(x_ca3, ec_input=None)
+            h_prev = self._decode_ca1_to_hstate(x_ca1)
+            if h_prev is None:
+                break
+            if trajectory and h_prev.id == trajectory[-1].id:
+                break
+            trajectory.append(h_prev)
+
+        return trajectory
 
     def replay_recombine(
             self,
@@ -562,17 +606,53 @@ class Hippocampus:
             hstate_b: Union[HState, str],
             max_path_length: int = 10,
     ) -> List[List[HState]]:
-        """Explore novel paths between two states (creativity).
+        """Explore novel paths between two states via mixed CA3 dynamics.
 
-        Args:
-            hstate_a: First HState.
-            hstate_b: Second HState.
-            max_path_length: Maximum path length.
-
-        Returns:
-            List of possible paths between the states.
+        Uses a noisy superposition of the DG→CA3 encodings for the two
+        starting HStates and decodes each step through CA1.
         """
-        return self.ca3.replay_recombine(hstate_a, hstate_b, max_path_length)
+        if isinstance(hstate_a, HState):
+            a = hstate_a
+        else:
+            a = self.get_hstate(hstate_a)
+
+        if isinstance(hstate_b, HState):
+            b = hstate_b
+        else:
+            b = self.get_hstate(hstate_b)
+
+        if a is None or b is None:
+            return []
+
+        dg_a = a.to_pattern(self.config.n_granule_cells)
+        dg_b = b.to_pattern(self.config.n_granule_cells)
+        ca3_a = self.ca3._project_from_dg(dg_a)
+        ca3_b = self.ca3._project_from_dg(dg_b)
+
+        paths: List[List[HState]] = []
+        n_rollouts = 3
+
+        for _ in range(n_rollouts):
+            noise = np.random.standard_normal(ca3_a.shape).astype(np.float32) * self.ca3.config.noise_level
+            x_ca3 = np.clip(0.5 * (ca3_a + ca3_b) + noise, 0.0, 1.0)
+            x_ca3 = self.ca3._k_wta(x_ca3, self.ca3.config.n_active_cells)
+
+            path: List[HState] = []
+            for _ in range(max_path_length):
+                x_ca1 = self.ca1.step(x_ca3, ec_input=None)
+                h = self._decode_ca1_to_hstate(x_ca1)
+                if h is None:
+                    break
+                if path and h.id == path[-1].id:
+                    break
+                path.append(h)
+                x_ca3 = self.ca3.step(x_ca3)
+
+            if path and all(len(path) != len(p) or any(h1.id != h2.id for h1, h2 in zip(path, p))
+                           for p in paths):
+                paths.append(path)
+
+        return paths
 
     def plan(
             self,
@@ -606,12 +686,33 @@ class Hippocampus:
         if goal_hstate is None:
             return []
 
-        paths = self.ca3.replay_policy_paths(
-            start=start_hstate,
-            goal=goal_hstate,
-            n_paths=n_candidates,
-            max_len=max_len,
-        )
+        # Goal-directed replay via CA3 dynamics + CA1 decoding
+        paths: List[List[HState]] = []
+
+        # Precompute goal modulation in CA3 space
+        goal_mod = self._compute_goal_modulation(goal_hstate)
+        value_mod = self._compute_value_modulation()
+
+        dg_start = start_hstate.to_pattern(self.config.n_granule_cells)
+        x0 = self.ca3._project_from_dg(dg_start)
+
+        for _ in range(n_candidates):
+            x_ca3 = x0.copy()
+            path: List[HState] = []
+            for _ in range(max_len):
+                x_ca3 = self.ca3.step(x_ca3, goal_mod=goal_mod, value_mod=value_mod)
+                x_ca1 = self.ca1.step(x_ca3, ec_input=None)
+                h = self._decode_ca1_to_hstate(x_ca1)
+                if h is None:
+                    break
+                if path and h.id == path[-1].id:
+                    break
+                path.append(h)
+                if h.id == goal_hstate.id:
+                    break
+            if path:
+                paths.append(path)
+
         return paths
 
     def _resolve_goal_descriptor(
@@ -666,13 +767,106 @@ class Hippocampus:
         best_hstate: Optional[HState] = None
         best_dist = float("inf")
 
-        for hstate in self.ca3.hstates:
+        for hstate in self._hstates.values():
+            if hstate.basis_vector is None:
+                continue
             dist = float(np.linalg.norm(hstate.basis_vector - target))
             if dist < best_dist:
                 best_dist = dist
                 best_hstate = hstate
 
         return best_hstate
+
+    def _decode_ca1_to_hstate(self, x_ca1: np.ndarray) -> Optional[HState]:
+        """Decode a CA1 SDR back to the closest stored HState.
+
+        Uses Jaccard overlap between active CA1 indices and each HState's
+        stored ca1_indices. If no HState carries CA1 indices (e.g., legacy
+        encodings), fall back to DG SDR overlap to avoid empty replays.
+        """
+        x = np.asarray(x_ca1, dtype=np.float32).ravel()
+        active = set(np.where(x > 0.5)[0])
+        if not active:
+            return None
+
+        best_h: Optional[HState] = None
+        best_overlap = 0.0
+
+        # First try CA1-index-based match
+        for h in self._hstates.values():
+            if h.ca1_indices is None:
+                continue
+            h_set = set(h.ca1_indices)
+            if not h_set:
+                continue
+            inter = len(active & h_set)
+            union = len(active | h_set)
+            if union == 0:
+                continue
+            overlap = inter / union
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_h = h
+
+        if best_h is not None:
+            return best_h
+
+        # Fallback: DG-overlap match for legacy states without CA1 indices
+        dg_size = self.config.n_granule_cells
+        best_h = None
+        best_overlap = 0.0
+        for h in self._hstates.values():
+            h_set = set(h.sdr_indices)
+            if not h_set:
+                continue
+            inter = len(active & h_set)
+            union = len(active | h_set)
+            if union == 0:
+                continue
+            overlap = inter / union
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_h = h
+
+        return best_h
+
+    def _compute_goal_modulation(self, goal: HState) -> np.ndarray:
+        """Compute CA3 unit goal modulation from basis-space proximity."""
+        goal_mod = np.zeros(self.ca3.config.n_pyramidal_cells, dtype=np.float32)
+        if goal.basis_vector is None:
+            return goal_mod
+
+        for h in self._hstates.values():
+            if h.basis_vector is None:
+                continue
+            dist = float(np.linalg.norm(h.basis_vector - goal.basis_vector))
+            sim = 1.0 / (1.0 + dist)
+            if sim <= 0.0:
+                continue
+            dg_pattern = h.to_pattern(self.config.n_granule_cells)
+            ca3_pattern = self.ca3._project_from_dg(dg_pattern)
+            goal_mod += sim * ca3_pattern
+
+        if np.max(goal_mod) > 0:
+            goal_mod /= float(np.max(goal_mod))
+        return goal_mod
+
+    def _compute_value_modulation(self) -> np.ndarray:
+        """Compute CA3 unit value modulation from stored HState values."""
+        value_mod = np.zeros(self.ca3.config.n_pyramidal_cells, dtype=np.float32)
+
+        for hid, val in self._hstate_values.items():
+            h = self._hstates.get(hid)
+            if h is None or abs(val) < 1e-8:
+                continue
+            dg_pattern = h.to_pattern(self.config.n_granule_cells)
+            ca3_pattern = self.ca3._project_from_dg(dg_pattern)
+            value_mod += float(val) * ca3_pattern
+
+        if np.max(np.abs(value_mod)) > 0:
+            value_mod /= float(np.max(np.abs(value_mod)))
+
+        return value_mod
 
     def _automatic_replay(self) -> None:
         """Perform automatic replay for consolidation."""
@@ -706,12 +900,7 @@ class Hippocampus:
     @property
     def n_hstates(self) -> int:
         """Number of stored HStates."""
-        return self.ca3.n_hstates
-
-    @property
-    def n_transitions(self) -> int:
-        """Number of learned transitions."""
-        return self.ca3.n_transitions
+        return len(self._hstates)
 
     @property
     def statistics(self) -> Dict[str, Any]:
@@ -721,8 +910,7 @@ class Hippocampus:
             Dictionary with statistics from all components.
         """
         return {
-            "n_hstates": self.ca3.n_hstates,
-            "n_transitions": self.ca3.n_transitions,
+            "n_hstates": len(self._hstates),
             "n_memories": self.ca3.n_memories,
             "n_episodes": len(self.memory),
             "n_cortical_associations": self.ca1.n_cortical_associations,
@@ -751,6 +939,5 @@ class Hippocampus:
         return (
             f"Hippocampus("
             f"hstates={self.n_hstates}, "
-            f"transitions={self.n_transitions}, "
             f"context={self._current_context})"
         )
