@@ -84,6 +84,7 @@ class ObjectRelation:
     object_a: str
     object_b: str
     co_occurrence_count: int = 0
+    co_occurrence_weight: float = 0.0
     spatial_displacements: List[np.ndarray] = field(default_factory=list)
     temporal_offsets: List[float] = field(default_factory=list)
     contexts: Set[str] = field(default_factory=set)
@@ -95,9 +96,11 @@ class ObjectRelation:
         temporal_offset: Optional[float] = None,
         context: Optional[str] = None,
         timestamp: float = 0.0,
+        weight: float = 1.0,
     ):
         """Record a new observation of this relation."""
         self.co_occurrence_count += 1
+        self.co_occurrence_weight += float(weight)
         self.last_update_time = timestamp
         
         if spatial_displacement is not None:
@@ -209,6 +212,7 @@ class HippocampalGraphMemory:
         temporal_offset: Optional[float] = None,
         context: Optional[str] = None,
         timestamp: float = 0.0,
+        weight: float = 1.0,
     ) -> None:
         """Add or update a relation between two objects.
         
@@ -241,6 +245,7 @@ class HippocampalGraphMemory:
                 temporal_offset=temporal_offset,
                 context=context,
                 timestamp=timestamp,
+                weight=weight,
             )
     
     def get_related_objects(
@@ -520,8 +525,9 @@ class HippocampalGraphMemory:
             if obj_a >= obj_b:  # Skip symmetric duplicates
                 continue
             
-            # Score by co-occurrence, optionally filtered by context
-            count = relation.co_occurrence_count
+            # Score by co-occurrence weight (falls back to count if unset),
+            # optionally filtered by context.
+            count = int(relation.co_occurrence_weight) if relation.co_occurrence_weight > 0 else relation.co_occurrence_count
             if context_filter and context_filter not in relation.contexts:
                 count = 0
             

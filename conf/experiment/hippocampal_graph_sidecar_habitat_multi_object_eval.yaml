@@ -17,4 +17,11 @@ config:
     context_from_primary_target: true
     dedupe_consecutive_object_ids: true
     output_confidence_threshold: 0.0
+    enable_belief_encoding: true
+    belief_window_size: 20
+    belief_top_k: 5
+    belief_p_min: 0.15
+    belief_entropy_max: 1.2
+    belief_novelty_min: 0.15
+    belief_min_objects: 2
     write_csv: true

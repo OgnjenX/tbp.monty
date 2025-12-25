@@ -9,18 +9,22 @@
 
 from __future__ import annotations
 
+from collections import deque
 import csv
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 import numpy as np
 
 from tbp.monty.frameworks.experiments.object_recognition_experiments import (
     MontyObjectRecognitionExperiment,
 )
-from tbp.monty.frameworks.models.hippocampal_graph_lm import HippocampalGraphLM
+from tbp.monty.frameworks.models.hippocampal_graph_lm import (
+    HippocampalGraphLM,
+    ObjectObservation,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +40,14 @@ class HippocampalGraphSidecarConfig:
     context_from_primary_target: bool = False
     dedupe_consecutive_object_ids: bool = True
     output_confidence_threshold: float = 0.0
+    # Optional belief encoding (top-k hypotheses from votes, gated commit)
+    enable_belief_encoding: bool = False
+    belief_window_size: int = 20
+    belief_top_k: int = 5
+    belief_p_min: float = 0.15
+    belief_entropy_max: float = 1.2
+    belief_novelty_min: float = 0.15
+    belief_min_objects: int = 2
     write_csv: bool = True
 
 
@@ -62,6 +74,11 @@ class MontyObjectRecognitionHippocampalGraphSidecarExperiment(
         self._hipp_csv_file = None
         self._hipp_csv_writer: Optional[csv.DictWriter] = None
         self._last_object_id: Optional[str] = None
+        self._belief_buffer: deque[Tuple[float, list[Tuple[str, float, np.ndarray]]]] = deque()
+        self._prev_dist: Optional[Dict[str, float]] = None
+        self._episode_observation_count: int = 0
+        self._last_committed_cue: Optional[str] = None
+        self._semantic_id_to_label: Optional[Dict[Any, str]] = None
 
     def setup_experiment(self, config: Dict[str, Any]) -> None:
         super().setup_experiment(config)
@@ -112,6 +129,11 @@ class MontyObjectRecognitionHippocampalGraphSidecarExperiment(
 
         self._hipp.reset()
         self._last_object_id = None
+        self._belief_buffer.clear()
+        self._prev_dist = None
+        self._episode_observation_count = 0
+        self._last_committed_cue = None
+        self._semantic_id_to_label = getattr(self.env_interface, "semantic_id_to_label", None)
 
         context = None
         if self._hipp_cfg.context_from_primary_target:
@@ -121,14 +143,18 @@ class MontyObjectRecognitionHippocampalGraphSidecarExperiment(
 
     def post_episode(self, steps):
         if self._hipp is not None:
-            n_obs = len(self._hipp.current_episode_observations)
-            cue = None
             context = self._hipp.current_episode_context
-            if n_obs > 0:
-                cue = self._hipp.current_episode_observations[0].object_id
 
-            self._hipp.end_episode()
+            if self._hipp_cfg.enable_belief_encoding:
+                self._flush_belief_buffer(force=True)
+                self._hipp.current_episode_observations = []
+                self._hipp.current_episode_context = None
+            else:
+                self._hipp.end_episode()
+
             stats = self._hipp.get_statistics()
+            n_obs = self._episode_observation_count
+            cue = self._last_committed_cue
 
             suggestions = []
             if cue is not None:
@@ -211,7 +237,10 @@ class MontyObjectRecognitionHippocampalGraphSidecarExperiment(
     def _step_hippocampus(self, step: int) -> None:
         if self._hipp is None:
             return
-        self._observe_from_lms(step_timestamp=float(step))
+        if self._hipp_cfg.enable_belief_encoding:
+            self._observe_beliefs_from_lms(step_timestamp=float(step))
+        else:
+            self._observe_from_lms(step_timestamp=float(step))
 
     def _observe_from_lms(self, step_timestamp: float) -> None:
         if self._hipp is None:
@@ -230,6 +259,8 @@ class MontyObjectRecognitionHippocampalGraphSidecarExperiment(
                 source_lm=observation_data["source_lm"],
             )
             self._last_object_id = observation_data["object_id"]
+            self._episode_observation_count += 1
+            self._last_committed_cue = observation_data["object_id"]
 
     def _extract_observation_data(self, lm) -> Optional[Dict[str, Any]]:
         """Extract and validate observation data from a learning module.
@@ -273,3 +304,192 @@ class MontyObjectRecognitionHippocampalGraphSidecarExperiment(
             "confidence": confidence,
             "source_lm": str(getattr(lm, "learning_module_id", "lm")),
         }
+
+    def _observe_beliefs_from_lms(self, step_timestamp: float) -> None:
+        """Collect top-k hypotheses from votes and commit weighted co-activations."""
+        candidates = self._collect_vote_candidates(top_k=self._hipp_cfg.belief_top_k)
+        if not candidates:
+            return
+
+        dist = {obj_id: prob for obj_id, prob, _ in candidates}
+        entropy = self._entropy([prob for _, prob, _ in candidates])
+        max_p = max(prob for _, prob, _ in candidates)
+        stable = (max_p >= self._hipp_cfg.belief_p_min) or (entropy <= self._hipp_cfg.belief_entropy_max)
+
+        novelty = 1.0
+        if self._prev_dist is not None:
+            novelty = 1.0 - self._cosine_similarity_dict(dist, self._prev_dist)
+        self._prev_dist = dist
+
+        if stable:
+            self._belief_buffer.append((step_timestamp, candidates))
+            maxlen = max(1, int(self._hipp_cfg.belief_window_size))
+            while len(self._belief_buffer) > maxlen:
+                self._belief_buffer.popleft()
+
+        if not stable or novelty < self._hipp_cfg.belief_novelty_min:
+            return
+
+        if self._count_distinct_objects_in_buffer() < max(2, int(self._hipp_cfg.belief_min_objects)):
+            return
+
+        self._flush_belief_buffer(force=False)
+
+    def _flush_belief_buffer(self, force: bool) -> None:
+        if self._hipp is None or not self._belief_buffer:
+            return
+
+        context = self._hipp.current_episode_context
+
+        evidence: Dict[str, float] = {}
+        loc_sums: Dict[str, np.ndarray] = {}
+        time_sums: Dict[str, float] = {}
+
+        for t, candidates in self._belief_buffer:
+            for obj_id, prob, location in candidates:
+                evidence[obj_id] = evidence.get(obj_id, 0.0) + prob
+                loc_sums[obj_id] = loc_sums.get(obj_id, np.zeros(3, dtype=float)) + (prob * location)
+                time_sums[obj_id] = time_sums.get(obj_id, 0.0) + (prob * t)
+
+        objects = [o for o, e in evidence.items() if e > 0.0]
+        if len(objects) < max(2, int(self._hipp_cfg.belief_min_objects)):
+            if force:
+                self._belief_buffer.clear()
+            return
+
+        # Gate strength: keep simple (bounded) for now.
+        last_candidates = self._belief_buffer[-1][1]
+        last_max_p = max(prob for _, prob, _ in last_candidates)
+        gate_strength = float(np.clip(last_max_p, 0.0, 1.0))
+
+        # Create a condensed "gist" episode for completion/replay.
+        episode_obs: list[ObjectObservation] = []
+        for obj_id in sorted(objects, key=lambda o: evidence[o], reverse=True)[:10]:
+            e = evidence[obj_id]
+            loc = loc_sums[obj_id] / max(1e-9, e)
+            ts = time_sums[obj_id] / max(1e-9, e)
+            episode_obs.append(
+                ObjectObservation(
+                    object_id=obj_id,
+                    location=loc,
+                    timestamp=float(ts),
+                    confidence=float(np.clip(e, 0.0, 1.0)),
+                    source_lm="belief_buffer",
+                )
+            )
+
+        if not episode_obs:
+            self._belief_buffer.clear()
+            return
+
+        self._hipp.graph_memory.store_episode(episode_obs, context=context)
+        self._hipp.graph_memory.episode_count += 1
+        while len(self._hipp.graph_memory.episode_history) > self._hipp_cfg.max_episode_history:
+            self._hipp.graph_memory.episode_history.pop(0)
+        self._episode_observation_count += len(episode_obs)
+        self._last_committed_cue = episode_obs[0].object_id
+
+        # Weighted co-activation updates.
+        for i, obj_a in enumerate(objects):
+            for obj_b in objects[i + 1:]:
+                e_a = evidence[obj_a]
+                e_b = evidence[obj_b]
+                if e_a <= 0.0 or e_b <= 0.0:
+                    continue
+                loc_a = loc_sums[obj_a] / max(1e-9, e_a)
+                loc_b = loc_sums[obj_b] / max(1e-9, e_b)
+                t_a = time_sums[obj_a] / max(1e-9, e_a)
+                t_b = time_sums[obj_b] / max(1e-9, e_b)
+                weight = gate_strength * e_a * e_b
+                self._hipp.graph_memory.add_relation(
+                    object_a=obj_a,
+                    object_b=obj_b,
+                    spatial_displacement=loc_b - loc_a,
+                    temporal_offset=float(t_b - t_a),
+                    context=context,
+                    timestamp=self._hipp.graph_memory.current_time,
+                    weight=weight,
+                )
+
+        self._hipp.graph_memory.total_observations += len(episode_obs)
+        self._hipp.graph_memory.current_time += 1.0
+        self._belief_buffer.clear()
+
+    def _collect_vote_candidates(self, top_k: int) -> list[Tuple[str, float, np.ndarray]]:
+        """Collect and normalize top-k vote candidates across all LMs."""
+        if self._hipp is None:
+            return []
+
+        raw: list[Tuple[str, float, np.ndarray]] = []
+        for lm in getattr(self.model, "learning_modules", []):
+            try:
+                vote = lm.send_out_vote()
+            except Exception:
+                continue
+            if not isinstance(vote, dict):
+                continue
+            possible_states = vote.get("possible_states", {})
+            if not isinstance(possible_states, dict):
+                continue
+
+            for graph_id, states in possible_states.items():
+                if not isinstance(states, Sequence) or not states:
+                    continue
+                best_state = max(states, key=lambda s: float(getattr(s, "confidence", 0.0)))
+                conf = float(getattr(best_state, "confidence", 0.0))
+                loc = np.asarray(getattr(best_state, "location", None), dtype=float)
+                if np.size(loc) == 0:
+                    continue
+                obj_id = self._normalize_object_id(graph_id)
+                raw.append((obj_id, conf, loc))
+
+        if not raw:
+            return []
+
+        raw.sort(key=lambda t: t[1], reverse=True)
+        candidates = raw[: max(1, int(top_k))]
+        total = sum(max(0.0, c) for _, c, _ in candidates)
+        if total <= 0:
+            prob = 1.0 / len(candidates)
+            return [(obj_id, prob, loc) for obj_id, _, loc in candidates]
+
+        return [(obj_id, conf / total, loc) for obj_id, conf, loc in candidates]
+
+    def _count_distinct_objects_in_buffer(self) -> int:
+        seen: set[str] = set()
+        for _, candidates in self._belief_buffer:
+            for obj_id, prob, _ in candidates:
+                if prob > 0:
+                    seen.add(obj_id)
+        return len(seen)
+
+    def _normalize_object_id(self, object_id: Any) -> str:
+        """Map semantic ids to labels when possible, otherwise stringify."""
+        mapping = self._semantic_id_to_label
+        if not mapping:
+            return str(object_id)
+        try:
+            if isinstance(object_id, str) and object_id.isdigit():
+                object_id_int = int(object_id)
+                return str(mapping.get(object_id_int, object_id))
+            return str(mapping.get(object_id, object_id))
+        except Exception:
+            return str(object_id)
+
+    @staticmethod
+    def _entropy(probs: list[float]) -> float:
+        p = np.asarray(probs, dtype=float)
+        p = p[p > 0]
+        if p.size == 0:
+            return 0.0
+        return float(-np.sum(p * np.log(p)))
+
+    @staticmethod
+    def _cosine_similarity_dict(a: Dict[str, float], b: Dict[str, float]) -> float:
+        keys = sorted(set(a.keys()) | set(b.keys()))
+        va = np.array([a.get(k, 0.0) for k in keys], dtype=float)
+        vb = np.array([b.get(k, 0.0) for k in keys], dtype=float)
+        denom = float(np.linalg.norm(va) * np.linalg.norm(vb))
+        if denom == 0.0:
+            return 0.0
+        return float(np.dot(va, vb) / denom)
