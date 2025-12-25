@@ -1,0 +1,19 @@
+defaults:
+  - multi_object_world_image_on_scanned_model
+  - _self_
+
+_target_: tbp.monty.frameworks.experiments.hippocampal_graph_sidecar_experiment.MontyObjectRecognitionHippocampalGraphSidecarExperiment
+config:
+  logging:
+    run_name: hippocampal_graph_sidecar_multi_object_world_image
+  hippocampal_graph:
+    enabled: true
+    learning_rate: 0.8
+    decay_rate: 0.0
+    enable_replay: true
+    max_episode_history: 200
+    # For world-image scenes this maps to the current scene's object label.
+    context_from_primary_target: true
+    dedupe_consecutive_object_ids: true
+    output_confidence_threshold: 0.0
+    write_csv: true
