@@ -1,0 +1,20 @@
+defaults:
+  - base_10multi_distinctobj_dist_agent
+  - _self_
+
+_target_: tbp.monty.frameworks.experiments.hippocampal_graph_sidecar_experiment.MontyObjectRecognitionHippocampalGraphSidecarExperiment
+config:
+  logging:
+    run_name: hippocampal_graph_sidecar_habitat_multi_object_eval
+  # Ensure we load a pretrained neocortical model so the sidecar sees outputs.
+  model_name_or_path: ${benchmarks.pretrained_dir}/surf_agent_1lm_10distinctobj/pretrained/
+  hippocampal_graph:
+    enabled: true
+    learning_rate: 0.8
+    decay_rate: 0.0
+    enable_replay: true
+    max_episode_history: 200
+    context_from_primary_target: true
+    dedupe_consecutive_object_ids: true
+    output_confidence_threshold: 0.0
+    write_csv: true

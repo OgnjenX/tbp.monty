@@ -276,6 +276,13 @@ class SaccadeOnImageEnvironment(EmbodiedEnvironment):
         self.state = 0
         self.data_path = monty_data_path(data_path, "worldimages/labeled_scenes")
         self.scene_names = [a.name for a in sorted(self.data_path.glob("[!.]*"))]
+        if not self.scene_names:
+            raise ValueError(
+                "No world-image scenes found. "
+                f"Expected scene folders under `{self.data_path}`. "
+                "Set `MONTY_DATA` to the root data directory (containing `worldimages/`), "
+                "or pass `data_path` explicitly in the environment init args."
+            )
         self.current_scene = self.scene_names[0]
         self.scene_version = 0
 
