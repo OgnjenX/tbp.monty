@@ -357,12 +357,58 @@ class MontyObjectRecognitionHippocampalGraphSidecarExperiment(
                 self._belief_buffer.clear()
             return
 
-        # Gate strength: keep simple (bounded) for now.
+        gate_strength = self._compute_gate_strength()
+
+        episode_obs = self._create_episode_observations(
+            objects, evidence, loc_sums, time_sums
+        )
+
+        if not episode_obs:
+            self._belief_buffer.clear()
+            return
+
+        self._hipp.graph_memory.store_episode(episode_obs, context=context)
+        self._hipp.graph_memory.episode_count += 1
+        while len(self._hipp.graph_memory.episode_history) > self._hipp_cfg.max_episode_history:
+            self._hipp.graph_memory.episode_history.pop(0)
+        self._episode_observation_count += len(episode_obs)
+        self._last_committed_cue = episode_obs[0].object_id
+
+        self._update_weighted_coactivations(
+            objects, evidence, loc_sums, time_sums, gate_strength, context
+        )
+
+        self._hipp.graph_memory.total_observations += len(episode_obs)
+        self._hipp.graph_memory.current_time += 1.0
+        self._belief_buffer.clear()
+
+    def _collect_vote_candidates(self, top_k: int) -> list[Tuple[str, float, np.ndarray]]:
+        """Collect and normalize top-k vote candidates across all LMs."""
+        if self._hipp is None:
+            return []
+
+        raw = self._extract_raw_vote_candidates()
+        if not raw:
+            return []
+
+        return self._normalize_vote_candidates(raw, top_k)
+
+    def _compute_gate_strength(self) -> float:
+        """Compute gate strength from last belief buffer entry."""
+        if not self._belief_buffer:
+            return 0.0
         last_candidates = self._belief_buffer[-1][1]
         last_max_p = max(prob for _, prob, _ in last_candidates)
-        gate_strength = float(np.clip(last_max_p, 0.0, 1.0))
+        return float(np.clip(last_max_p, 0.0, 1.0))
 
-        # Create a condensed "gist" episode for completion/replay.
+    def _create_episode_observations(
+        self,
+        objects: list[str],
+        evidence: Dict[str, float],
+        loc_sums: Dict[str, np.ndarray],
+        time_sums: Dict[str, float],
+    ) -> list[ObjectObservation]:
+        """Create condensed episode observations from belief buffer."""
         episode_obs: list[ObjectObservation] = []
         for obj_id in sorted(objects, key=lambda o: evidence[o], reverse=True)[:10]:
             e = evidence[obj_id]
@@ -377,19 +423,20 @@ class MontyObjectRecognitionHippocampalGraphSidecarExperiment(
                     source_lm="belief_buffer",
                 )
             )
+        return episode_obs
 
-        if not episode_obs:
-            self._belief_buffer.clear()
+    def _update_weighted_coactivations(
+        self,
+        objects: list[str],
+        evidence: Dict[str, float],
+        loc_sums: Dict[str, np.ndarray],
+        time_sums: Dict[str, float],
+        gate_strength: float,
+        context: Optional[str],
+    ) -> None:
+        """Update weighted co-activation relations between objects."""
+        if self._hipp is None:
             return
-
-        self._hipp.graph_memory.store_episode(episode_obs, context=context)
-        self._hipp.graph_memory.episode_count += 1
-        while len(self._hipp.graph_memory.episode_history) > self._hipp_cfg.max_episode_history:
-            self._hipp.graph_memory.episode_history.pop(0)
-        self._episode_observation_count += len(episode_obs)
-        self._last_committed_cue = episode_obs[0].object_id
-
-        # Weighted co-activation updates.
         for i, obj_a in enumerate(objects):
             for obj_b in objects[i + 1:]:
                 e_a = evidence[obj_a]
@@ -411,48 +458,65 @@ class MontyObjectRecognitionHippocampalGraphSidecarExperiment(
                     weight=weight,
                 )
 
-        self._hipp.graph_memory.total_observations += len(episode_obs)
-        self._hipp.graph_memory.current_time += 1.0
-        self._belief_buffer.clear()
-
-    def _collect_vote_candidates(self, top_k: int) -> list[Tuple[str, float, np.ndarray]]:
-        """Collect and normalize top-k vote candidates across all LMs."""
-        if self._hipp is None:
-            return []
-
+    def _extract_raw_vote_candidates(self) -> list[Tuple[str, float, np.ndarray]]:
+        """Extract raw vote candidates from all learning modules."""
         raw: list[Tuple[str, float, np.ndarray]] = []
         for lm in getattr(self.model, "learning_modules", []):
-            try:
-                vote = lm.send_out_vote()
-            except Exception:
-                continue
-            if not isinstance(vote, dict):
-                continue
-            possible_states = vote.get("possible_states", {})
-            if not isinstance(possible_states, dict):
-                continue
+            raw.extend(self._process_lm_vote(lm))
+        return raw
 
-            for graph_id, states in possible_states.items():
-                if not isinstance(states, Sequence) or not states:
-                    continue
-                best_state = max(states, key=lambda s: float(getattr(s, "confidence", 0.0)))
-                conf = float(getattr(best_state, "confidence", 0.0))
-                loc = np.asarray(getattr(best_state, "location", None), dtype=float)
-                if np.size(loc) == 0:
-                    continue
-                obj_id = self._normalize_object_id(graph_id)
-                raw.append((obj_id, conf, loc))
+    def _process_lm_vote(self, lm) -> list[Tuple[str, float, np.ndarray]]:
+        """Process a single learning module's vote.
 
-        if not raw:
+        A learning module may emit multiple possible states (e.g., multiple graph ids);
+        each state contributes a raw candidate that can affect normalization and gating.
+        """
+        try:
+            vote = lm.send_out_vote()
+        except Exception:
+            return []
+        
+        if not isinstance(vote, dict):
+            return []
+        
+        possible_states = vote.get("possible_states", {})
+        if not isinstance(possible_states, dict):
             return []
 
+        candidates: list[Tuple[str, float, np.ndarray]] = []
+        for graph_id, states in possible_states.items():
+            candidate = self._extract_best_state(graph_id, states)
+            if candidate:
+                candidates.append(candidate)
+        return candidates
+
+    def _extract_best_state(self, graph_id: Any, states) -> Optional[Tuple[str, float, np.ndarray]]:
+        """Extract best state from possible states."""
+        if not isinstance(states, Sequence) or not states:
+            return None
+        
+        best_state = max(states, key=lambda s: float(getattr(s, "confidence", 0.0)))
+        conf = float(getattr(best_state, "confidence", 0.0))
+        loc = np.asarray(getattr(best_state, "location", None), dtype=float)
+        
+        if np.size(loc) == 0:
+            return None
+        
+        obj_id = self._normalize_object_id(graph_id)
+        return (obj_id, conf, loc)
+
+    def _normalize_vote_candidates(
+        self, raw: list[Tuple[str, float, np.ndarray]], top_k: int
+    ) -> list[Tuple[str, float, np.ndarray]]:
+        """Normalize and return top-k vote candidates."""
         raw.sort(key=lambda t: t[1], reverse=True)
         candidates = raw[: max(1, int(top_k))]
         total = sum(max(0.0, c) for _, c, _ in candidates)
+        
         if total <= 0:
             prob = 1.0 / len(candidates)
             return [(obj_id, prob, loc) for obj_id, _, loc in candidates]
-
+        
         return [(obj_id, conf / total, loc) for obj_id, conf, loc in candidates]
 
     def _count_distinct_objects_in_buffer(self) -> int:
@@ -479,10 +543,10 @@ class MontyObjectRecognitionHippocampalGraphSidecarExperiment(
     @staticmethod
     def _entropy(probs: list[float]) -> float:
         p = np.asarray(probs, dtype=float)
-        p = p[p > 0]
-        if p.size == 0:
+        p = np.asarray(p[p > 0], dtype=float)
+        if p.size < 1:
             return 0.0
-        return float(-np.sum(p * np.log(p)))
+        return float(np.sum(-p * np.log(p)))
 
     @staticmethod
     def _cosine_similarity_dict(a: Dict[str, float], b: Dict[str, float]) -> float:
@@ -490,6 +554,6 @@ class MontyObjectRecognitionHippocampalGraphSidecarExperiment(
         va = np.array([a.get(k, 0.0) for k in keys], dtype=float)
         vb = np.array([b.get(k, 0.0) for k in keys], dtype=float)
         denom = float(np.linalg.norm(va) * np.linalg.norm(vb))
-        if denom == 0.0:
+        if denom <= 0.0:
             return 0.0
         return float(np.dot(va, vb) / denom)
