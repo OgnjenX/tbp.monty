@@ -21,6 +21,7 @@ import numpy as np
 from tbp.monty.frameworks.experiments.object_recognition_experiments import (
     MontyObjectRecognitionExperiment,
 )
+from tbp.monty.frameworks.models.abstract_monty_classes import LearningModule
 from tbp.monty.frameworks.models.hippocampal_graph_lm import (
     HippocampalGraphLM,
     ObjectObservation,
@@ -465,7 +466,7 @@ class MontyObjectRecognitionHippocampalGraphSidecarExperiment(
             raw.extend(self._process_lm_vote(lm))
         return raw
 
-    def _process_lm_vote(self, lm) -> list[Tuple[str, float, np.ndarray]]:
+    def _process_lm_vote(self, lm: LearningModule) -> list[Tuple[str, float, np.ndarray]]:
         """Process a single learning module's vote.
 
         A learning module may emit multiple possible states (e.g., multiple graph ids);
@@ -479,7 +480,7 @@ class MontyObjectRecognitionHippocampalGraphSidecarExperiment(
         if not isinstance(vote, dict):
             return []
         
-        possible_states = vote.get("possible_states", {})
+        possible_states: Dict[str, Any] = vote.get("possible_states", {})
         if not isinstance(possible_states, dict):
             return []
 
