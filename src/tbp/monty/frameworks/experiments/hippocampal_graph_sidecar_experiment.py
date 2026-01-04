@@ -25,6 +25,11 @@ from tbp.monty.frameworks.models.abstract_monty_classes import LearningModule
 from tbp.monty.frameworks.models.hippocampal_graph_lm import (
     HippocampalGraphLM,
     ObjectObservation,
+    ReplayBatch,
+)
+from tbp.monty.frameworks.models.transition_consolidation_lm import (
+    SequenceReplayMemory,
+    TransitionConsolidationMemory,
 )
 
 logger = logging.getLogger(__name__)
@@ -41,6 +46,16 @@ class HippocampalGraphSidecarConfig:
     context_from_primary_target: bool = False
     dedupe_consecutive_object_ids: bool = True
     output_confidence_threshold: float = 0.0
+    # Completion suggestions behavior (pattern completion vs temporal "next")
+    completion_use_temporal: bool = False
+    # Optional replay-to-consolidation target (simple cortical transition memory)
+    enable_consolidation: bool = False
+    consolidation_dedupe_consecutive_object_ids: bool = True
+    replay_episode_batches_per_episode: int = 0
+    replay_relation_batches_per_episode: int = 0
+    replay_sequence_batches_per_episode: int = 0
+    replay_top_k_relations: int = 10
+    replay_temperature: float = 1.0
     # Optional belief encoding (top-k hypotheses from votes, gated commit)
     enable_belief_encoding: bool = False
     belief_window_size: int = 20
@@ -71,6 +86,9 @@ class MontyObjectRecognitionHippocampalGraphSidecarExperiment(
             **dict(config.get("hippocampal_graph", {}))
         )
         self._hipp: Optional[HippocampalGraphLM] = None
+        self._consolidation: Optional[TransitionConsolidationMemory] = None
+        self._sequence_replay: Optional[SequenceReplayMemory] = None
+        self._sequence_episode: list[ObjectObservation] = []
         self._hipp_csv_path: Optional[Path] = None
         self._hipp_csv_file = None
         self._hipp_csv_writer: Optional[csv.DictWriter] = None
@@ -94,6 +112,15 @@ class MontyObjectRecognitionHippocampalGraphSidecarExperiment(
             max_episode_history=self._hipp_cfg.max_episode_history,
         )
 
+        if self._hipp_cfg.enable_consolidation:
+            self._consolidation = TransitionConsolidationMemory(
+                dedupe_consecutive_object_ids=self._hipp_cfg.consolidation_dedupe_consecutive_object_ids
+            )
+            self._hipp.register_replay_callback(self._on_hippocampal_replay)
+            self._sequence_replay = SequenceReplayMemory(
+                max_episode_history=self._hipp_cfg.max_episode_history
+            )
+
         if self._hipp_cfg.write_csv:
             self._hipp_csv_path = self.output_dir / "hippocampal_graph_sidecar.csv"
             self._hipp_csv_file = self._hipp_csv_path.open("w", newline="")
@@ -112,6 +139,10 @@ class MontyObjectRecognitionHippocampalGraphSidecarExperiment(
                     "total_observations",
                     "completion_cue",
                     "completion_suggestions",
+                    "consolidation_n_objects",
+                    "consolidation_n_transitions",
+                    "consolidation_total_transitions",
+                    "sequence_n_observations",
                 ],
             )
             self._hipp_csv_writer.writeheader()
@@ -135,6 +166,7 @@ class MontyObjectRecognitionHippocampalGraphSidecarExperiment(
         self._episode_observation_count = 0
         self._last_committed_cue = None
         self._semantic_id_to_label = getattr(self.env_interface, "semantic_id_to_label", None)
+        self._sequence_episode = []
 
         context = None
         if self._hipp_cfg.context_from_primary_target:
@@ -157,46 +189,114 @@ class MontyObjectRecognitionHippocampalGraphSidecarExperiment(
             n_obs = self._episode_observation_count
             cue = self._last_committed_cue
 
-            suggestions = []
-            if cue is not None:
-                suggestions = self._hipp.complete_from_cue(
-                    [cue],
-                    context_filter=context,
-                    top_k_objects=5,
-                )
+            suggestions = self._get_completion_suggestions(cue, context)
+
+            self._run_replay_to_consolidation(context=context)
+            consolidation_stats = self._consolidation.get_statistics() if self._consolidation is not None else {}
 
             if self._hipp_csv_writer is not None:
-                phase = (
-                    "train" if self.experiment_mode.value == "train" else "eval"
-                )
-                episode_index = (
-                    self.train_episodes
-                    if phase == "train"
-                    else self.eval_episodes
-                )
-                primary_target = getattr(self.env_interface, "primary_target", {}).get(
-                    "object"
-                )
-                self._hipp_csv_writer.writerow(
-                    {
-                        "phase": phase,
-                        "episode_index": episode_index,
-                        "primary_target": primary_target,
-                        "context": context,
-                        "n_observations_in_episode": n_obs,
-                        "episode_count": stats.get("episode_count"),
-                        "stored_episodes": stats.get("stored_episodes"),
-                        "n_objects": stats.get("n_objects"),
-                        "n_relations": stats.get("n_relations"),
-                        "total_observations": stats.get("total_observations"),
-                        "completion_cue": cue,
-                        "completion_suggestions": ";".join(
-                            f"{obj}:{score:.3f}" for obj, score in suggestions
-                        ),
-                    }
-                )
+                self._write_hipp_csv(context, stats, n_obs, cue, suggestions, consolidation_stats)
 
         super().post_episode(steps)
+
+    def _get_completion_suggestions(self, cue: Optional[str], context: Optional[str]) -> list[Tuple[str, float]]:
+        """Return completion suggestions for a cue or an empty list."""
+        if cue is None or self._hipp is None:
+            return []
+        if self._hipp_cfg.completion_use_temporal:
+            return self._hipp.graph_memory.get_temporal_next_candidates(
+                current_object=cue,
+                context=context,
+                top_k=5,
+            )
+        return self._hipp.complete_from_cue([cue], context_filter=context, top_k_objects=5)
+
+    def _write_hipp_csv(
+        self,
+        context: Optional[str],
+        stats: Dict[str, Any],
+        n_obs: int,
+        cue: Optional[str],
+        suggestions: list[Tuple[str, float]],
+        consolidation_stats: Dict[str, Any],
+    ) -> None:
+        """Write a single CSV row for hippocampal sidecar stats."""
+        if self._hipp_csv_writer is None:
+            return
+
+        phase = "train" if self.experiment_mode.value == "train" else "eval"
+        episode_index = self.train_episodes if phase == "train" else self.eval_episodes
+        primary_target = getattr(self.env_interface, "primary_target", {}).get("object")
+        writer = self._hipp_csv_writer
+        writer.writerow(
+            {
+                "phase": phase,
+                "episode_index": episode_index,
+                "primary_target": primary_target,
+                "context": context,
+                "n_observations_in_episode": n_obs,
+                "episode_count": stats.get("episode_count"),
+                "stored_episodes": stats.get("stored_episodes"),
+                "n_objects": stats.get("n_objects"),
+                "n_relations": stats.get("n_relations"),
+                "total_observations": stats.get("total_observations"),
+                "completion_cue": cue,
+                "completion_suggestions": ";".join(
+                    f"{obj}:{score:.3f}" for obj, score in suggestions
+                ),
+                "consolidation_n_objects": consolidation_stats.get("n_objects"),
+                "consolidation_n_transitions": consolidation_stats.get("n_transitions"),
+                "consolidation_total_transitions": consolidation_stats.get("total_transitions"),
+                "sequence_n_observations": len(self._sequence_episode),
+            }
+        )
+
+    def _on_hippocampal_replay(self, batch) -> None:
+        if self._consolidation is None:
+            return
+        self._consolidation.observe_replay_batch(batch)
+
+    def _run_replay_to_consolidation(self, context: Optional[str]) -> None:
+        if self._hipp is None or self._consolidation is None:
+            return
+
+        n_ep = int(self._hipp_cfg.replay_episode_batches_per_episode)
+        n_rel = int(self._hipp_cfg.replay_relation_batches_per_episode)
+        n_seq = int(self._hipp_cfg.replay_sequence_batches_per_episode)
+        if n_ep <= 0 and n_rel <= 0 and n_seq <= 0:
+            return
+
+        if n_ep > 0:
+            self._hipp.replay_episodes(
+                num_replays=n_ep,
+                context_filter=context,
+                invoke_callbacks=True,
+            )
+
+        if n_rel > 0:
+            self._hipp.replay_relations(
+                num_replays=n_rel,
+                top_k_relations=int(self._hipp_cfg.replay_top_k_relations),
+                temperature=float(self._hipp_cfg.replay_temperature),
+                context_filter=context,
+                invoke_callbacks=True,
+            )
+
+        if n_seq > 0 and self._sequence_replay is not None:
+            if len(self._sequence_episode) >= 2:
+                self._sequence_replay.store_episode(
+                    ReplayBatch(
+                        observations=self._sequence_episode.copy(),
+                        source_type="sequence_episode",
+                        batch_id=f"sequence_episode_{self._hipp.graph_memory.episode_count}",
+                        context=context,
+                    )
+                )
+            for batch in self._sequence_replay.generate_episode_replay(
+                num_replays=n_seq,
+                context_filter=context,
+            ):
+                self._consolidation.observe_replay_batch(batch)
 
     def run_episode_steps(self):
         env_interface = self.env_interface
@@ -253,6 +353,13 @@ class MontyObjectRecognitionHippocampalGraphSidecarExperiment(
                 continue
 
             self._hipp.observe_object(
+                object_id=observation_data["object_id"],
+                location=observation_data["location"],
+                timestamp=step_timestamp,
+                confidence=observation_data["confidence"],
+                source_lm=observation_data["source_lm"],
+            )
+            self._append_to_sequence_episode(
                 object_id=observation_data["object_id"],
                 location=observation_data["location"],
                 timestamp=step_timestamp,
@@ -327,6 +434,18 @@ class MontyObjectRecognitionHippocampalGraphSidecarExperiment(
             maxlen = max(1, int(self._hipp_cfg.belief_window_size))
             while len(self._belief_buffer) > maxlen:
                 self._belief_buffer.popleft()
+            # Separate from co-occurrence encoding: commit a single best-guess
+            # observation per step for true temporal transition learning.
+            best_obj_id, best_prob, best_location = max(
+                candidates, key=lambda t: t[1]
+            )
+            self._append_to_sequence_episode(
+                object_id=best_obj_id,
+                location=best_location,
+                timestamp=step_timestamp,
+                confidence=best_prob,
+                source_lm="votes",
+            )
 
         if not stable or novelty < self._hipp_cfg.belief_novelty_min:
             return
@@ -393,6 +512,35 @@ class MontyObjectRecognitionHippocampalGraphSidecarExperiment(
             return []
 
         return self._normalize_vote_candidates(raw, top_k)
+
+    def _append_to_sequence_episode(
+        self,
+        object_id: str,
+        location: np.ndarray,
+        timestamp: float,
+        confidence: float,
+        source_lm: str,
+    ) -> None:
+        if self._consolidation is None:
+            return
+
+        object_id = str(object_id)
+        if (
+            self._hipp_cfg.consolidation_dedupe_consecutive_object_ids
+            and self._sequence_episode
+            and self._sequence_episode[-1].object_id == object_id
+        ):
+            return
+
+        self._sequence_episode.append(
+            ObjectObservation(
+                object_id=object_id,
+                location=np.asarray(location, dtype=float),
+                timestamp=float(timestamp),
+                confidence=float(confidence),
+                source_lm=str(source_lm),
+            )
+        )
 
     def _compute_gate_strength(self) -> float:
         """Compute gate strength from last belief buffer entry."""

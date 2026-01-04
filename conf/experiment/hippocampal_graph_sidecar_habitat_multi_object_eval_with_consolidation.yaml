@@ -1,0 +1,16 @@
+defaults:
+  - hippocampal_graph_sidecar_habitat_multi_object_eval
+  - _self_
+
+_target_: tbp.monty.frameworks.experiments.hippocampal_graph_sidecar_experiment.MontyObjectRecognitionHippocampalGraphSidecarExperiment
+config:
+  logging:
+    run_name: hippocampal_graph_sidecar_habitat_multi_object_eval_with_consolidation
+  hippocampal_graph:
+    enable_consolidation: true
+    completion_use_temporal: true
+    replay_episode_batches_per_episode: 1
+    replay_relation_batches_per_episode: 2
+    replay_sequence_batches_per_episode: 1
+    replay_top_k_relations: 25
+    replay_temperature: 1.0

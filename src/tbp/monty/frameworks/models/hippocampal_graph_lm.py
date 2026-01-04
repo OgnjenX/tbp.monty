@@ -126,6 +126,23 @@ class ObjectRelation:
             return None
         return float(np.mean(self.temporal_offsets))
 
+    def temporal_forward_fraction(self) -> float:
+        """Fraction of temporal offsets that are forward (B after A)."""
+        if not self.temporal_offsets:
+            return 0.0
+        offsets = np.asarray(self.temporal_offsets, dtype=float)
+        return float(np.mean(offsets > 0))
+
+    def mean_positive_temporal_offset(self) -> Optional[float]:
+        """Mean positive temporal offset (B after A)."""
+        if not self.temporal_offsets:
+            return None
+        offsets = np.asarray(self.temporal_offsets, dtype=float)
+        positive = offsets[offsets > 0]
+        if positive.size == 0:
+            return None
+        return float(np.mean(positive))
+
 
 @dataclass
 class ReplayBatch:
@@ -306,18 +323,29 @@ class HippocampalGraphMemory:
         self,
         current_object: str,
         context: Optional[str] = None,
+        use_temporal: bool = False,
     ) -> Optional[str]:
         """Predict what object is likely to appear next.
         
-        Based on temporal sequence statistics.
+        Defaults to co-occurrence; optionally uses temporal offsets as a
+        lightweight transition model.
         
         Args:
             current_object: Object currently being observed.
             context: Optional context to filter predictions.
+            use_temporal: If True, prefer objects that tend to occur after the cue.
         
         Returns:
             Most likely next object ID, or None if no data.
         """
+        if use_temporal:
+            ranked = self.get_temporal_next_candidates(
+                current_object=current_object,
+                context=context,
+                top_k=1,
+            )
+            return ranked[0][0] if ranked else None
+
         related = self.get_related_objects(current_object)
         
         # Filter by context if provided
@@ -338,6 +366,55 @@ class HippocampalGraphMemory:
         )[0]
         
         return best_object
+
+    def get_temporal_next_candidates(
+        self,
+        current_object: str,
+        context: Optional[str] = None,
+        top_k: int = 5,
+        min_temporal_samples: int = 1,
+        eps: float = 1e-6,
+    ) -> List[Tuple[str, float]]:
+        """Rank likely next objects using temporal offsets.
+
+        A simple heuristic score:
+          score(A->B) = strength(A,B) * forward_fraction / (mean_positive_offset + eps)
+
+        Where:
+        - strength is co-occurrence weight (or count if weight is unset)
+        - forward_fraction is fraction of offsets > 0 (B after A)
+        - mean_positive_offset is mean of offsets > 0 (sooner is better)
+        """
+        if top_k <= 0:
+            return []
+
+        related = self.get_related_objects(current_object)
+        if context:
+            related = {
+                obj_id: rel for obj_id, rel in related.items() if context in rel.contexts
+            }
+        if not related:
+            return []
+
+        ranked: List[Tuple[str, float]] = []
+        for obj_id, rel in related.items():
+            if len(rel.temporal_offsets) < int(min_temporal_samples):
+                continue
+            forward_fraction = rel.temporal_forward_fraction()
+            mean_pos = rel.mean_positive_temporal_offset()
+            if mean_pos is None or forward_fraction <= 0.0:
+                continue
+            strength = (
+                float(rel.co_occurrence_weight)
+                if rel.co_occurrence_weight > 0
+                else float(rel.co_occurrence_count)
+            )
+            score = strength * forward_fraction / (float(mean_pos) + float(eps))
+            if score > 0.0:
+                ranked.append((obj_id, score))
+
+        ranked.sort(key=lambda kv: kv[1], reverse=True)
+        return ranked[:top_k]
     
     def clear(self) -> None:
         """Clear all stored relations."""
@@ -895,6 +972,7 @@ class HippocampalGraphLM(GraphLM):
         self,
         current_object: str,
         context: Optional[str] = None,
+        use_temporal: bool = False,
     ) -> Optional[str]:
         """Predict what object is likely to appear next.
         
@@ -905,7 +983,11 @@ class HippocampalGraphLM(GraphLM):
         Returns:
             Most likely next object ID, or None if no data.
         """
-        return self.graph_memory.predict_next_object(current_object, context)
+        return self.graph_memory.predict_next_object(
+            current_object,
+            context,
+            use_temporal=use_temporal,
+        )
     
     def get_most_common_neighbors(
         self,
