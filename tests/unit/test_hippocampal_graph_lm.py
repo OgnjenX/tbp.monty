@@ -180,6 +180,19 @@ class TestHippocampalGraphMemory:
         
         prediction = memory.predict_next_object("mug")
         assert prediction == "spoon"
+
+    def test_predict_next_object_temporal(self):
+        """Temporal prediction prefers objects that occur after the cue."""
+        memory = HippocampalGraphMemory()
+
+        # Both co-occur with mug, but only spoon tends to be after mug.
+        for _ in range(3):
+            memory.add_relation("mug", "spoon", temporal_offset=1.0)
+        for _ in range(3):
+            memory.add_relation("mug", "plate", temporal_offset=-1.0)
+
+        prediction = memory.predict_next_object("mug", use_temporal=True)
+        assert prediction == "spoon"
     
     def test_statistics(self):
         """Test getting memory statistics."""
