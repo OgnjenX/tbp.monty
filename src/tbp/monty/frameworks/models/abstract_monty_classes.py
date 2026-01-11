@@ -229,7 +229,7 @@ class LearningModule(metaclass=abc.ABCMeta):
         pass
 
     @abc.abstractmethod
-    def get_output(self):
+    def get_output(self) -> Any:
         """Return learning module output (same format as input)."""
         pass
 
@@ -238,12 +238,12 @@ class LearningModule(metaclass=abc.ABCMeta):
     ###
 
     @abc.abstractmethod
-    def state_dict(self):
+    def state_dict(self) -> Dict[str, Any]:
         """Return a serializable dict with everything needed to save/load this LM."""
         pass
 
     @abc.abstractmethod
-    def load_state_dict(self, state_dict):
+    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
         """Take a state dict as an argument and set state for this LM."""
         pass
 
@@ -269,12 +269,12 @@ class LMMemory(metaclass=abc.ABCMeta):
     ###
 
     @abc.abstractmethod
-    def state_dict(self):
+    def state_dict(self) -> Dict[str, Any]:
         """Return a serializable dict with everything needed to save/load the memory."""
         pass
 
     @abc.abstractmethod
-    def load_state_dict(self):
+    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
         """Take a state dict as an argument and set state for the memory."""
         pass
 

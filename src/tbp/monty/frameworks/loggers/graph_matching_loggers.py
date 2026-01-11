@@ -489,9 +489,14 @@ class BasicGraphMatchingLogger(BaseMontyLogger):
             overall_stats["episode/steps_per_lm_indv_ts"] = wandb.Histogram(
                 episode_individual_ts_steps
             )
-            overall_stats["episode/symmetry_evidence_per_lm"] = wandb.Histogram(
-                stats["episode_symmetry_evidence"][-len(self.lms) :]
-            )
+            symmetry_evidence = stats["episode_symmetry_evidence"][-len(self.lms) :]
+            valid_symmetry_evidence = [
+                e for e in symmetry_evidence if e is not None and not np.isnan(e)
+            ]
+            if valid_symmetry_evidence:
+                overall_stats["episode/symmetry_evidence_per_lm"] = wandb.Histogram(
+                    valid_symmetry_evidence
+                )
             overall_stats["episode/lm_performances"] = wandb.Histogram(
                 episode_lm_performances
             )

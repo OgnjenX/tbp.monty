@@ -6,6 +6,24 @@ _target_: tbp.monty.frameworks.experiments.hippocampal_graph_sidecar_experiment.
 config:
   logging:
     run_name: hippocampal_graph_sidecar_habitat_multi_object_eval_with_consolidation
+  monty_config:
+    # Allow a high-level LM to consume LM-to-LM inputs without direct SM inputs.
+    allow_lm_inputs_without_sm: true
+    # Allow loading a 1-LM checkpoint into a 2-LM config.
+    allow_partial_lm_load: true
+    learning_module_configs:
+      learning_module_1:
+        learning_module_class: ${monty.class:tbp.monty.frameworks.models.transition_consolidation_lm.CorticalTransitionLM}
+        learning_module_args:
+          dedupe_consecutive_object_ids: true
+    # LM0 is driven by the patch SM; LM1 consumes LM0 output only.
+    sm_to_lm_matrix:
+      - [0]
+      - []
+    lm_to_lm_matrix:
+      - []
+      - [0]
+    lm_to_lm_vote_matrix: null
   hippocampal_graph:
     enable_consolidation: true
     completion_use_temporal: true

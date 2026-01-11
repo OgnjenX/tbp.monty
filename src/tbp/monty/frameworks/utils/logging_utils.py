@@ -736,14 +736,47 @@ def get_stats_per_lm(model, target):
     performance_dict = {}
     primary_target_dict = target_data_to_dict(target)
     for i, lm in enumerate(model.learning_modules):
-        lm_stats = get_graph_lm_episode_stats(lm)
-        if hasattr(lm, "evidence"):
-            lm_stats = add_evidence_lm_episode_stats(
-                lm, lm_stats, target["consistent_child_objects"]
-            )
+        # Some experiments may include auxiliary LMs that don't implement the
+        # full GraphLM interface (buffer, poses, possible matches, etc.).
+        # Skip graph-matching episode stats for those LMs.
+        if not (
+            hasattr(lm, "buffer")
+            and hasattr(lm.buffer, "on_object")
+            and hasattr(lm.buffer, "stats")
+        ):
+            lm_stats = {
+                # Use None so overall stats aggregation skips this auxiliary LM.
+                "primary_performance": None,
+                "stepwise_performance": None,
+                "num_steps": 0,
+                "result": None,
+                "rotation_error": None,
+                "num_possible_matches": 0,
+                "detected_location": np.nan,
+                "detected_rotation": np.nan,
+                "detected_scale": np.nan,
+                "location_rel_body": np.nan,
+                "detected_path": np.nan,
+                "symmetry_evidence": np.nan,
+                "individual_ts_reached_at_step": None,
+                "individual_ts_performance": "n/a",
+                "individual_ts_rotation_error": None,
+                "time": np.nan,
+                "goal_states_attempted": 0,
+                "goal_state_achieved": 0,
+                "learning_module_id": getattr(lm, "learning_module_id", f"LM_{i}"),
+            }
+            if hasattr(lm, "memory") and hasattr(lm.memory, "get_statistics"):
+                lm_stats.update({f"transition_{k}": v for k, v in lm.memory.get_statistics().items()})
         else:
-            lm_stats = add_pose_lm_episode_stats(lm, lm_stats)
-        lm_stats = add_policy_episode_stats(lm, lm_stats)
+            lm_stats = get_graph_lm_episode_stats(lm)
+            if hasattr(lm, "evidence"):
+                lm_stats = add_evidence_lm_episode_stats(
+                    lm, lm_stats, target["consistent_child_objects"]
+                )
+            else:
+                lm_stats = add_pose_lm_episode_stats(lm, lm_stats)
+            lm_stats = add_policy_episode_stats(lm, lm_stats)
         lm_stats["monty_steps"] = model.episode_steps
         lm_stats["monty_matching_steps"] = model.matching_steps
         performance_dict[f"LM_{i}"] = lm_stats
