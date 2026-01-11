@@ -120,6 +120,9 @@ class MontyObjectRecognitionHippocampalGraphSidecarExperiment(
             self._sequence_replay = SequenceReplayMemory(
                 max_episode_history=self._hipp_cfg.max_episode_history
             )
+            for lm in getattr(self.model, "learning_modules", []):
+                if hasattr(lm, "on_replay_batch"):
+                    self._hipp.register_replay_callback(lm.on_replay_batch)
 
         if self._hipp_cfg.write_csv:
             self._hipp_csv_path = self.output_dir / "hippocampal_graph_sidecar.csv"

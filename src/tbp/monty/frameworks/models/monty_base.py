@@ -36,6 +36,8 @@ class MontyBase(Monty):
         min_train_steps,
         num_exploratory_steps,
         max_total_steps,
+        allow_lm_inputs_without_sm: bool = False,
+        allow_partial_lm_load: bool = False,
     ):
         """Initialize the base class.
 
@@ -87,6 +89,8 @@ class MontyBase(Monty):
         self.min_train_steps = min_train_steps
         self.num_exploratory_steps = num_exploratory_steps
         self.max_total_steps = max_total_steps
+        self.allow_lm_inputs_without_sm = bool(allow_lm_inputs_without_sm)
+        self.allow_partial_lm_load = bool(allow_partial_lm_load)
 
         # Counters, logging, default step_type
         self.step_type = "matching_step"
@@ -247,8 +251,13 @@ class MontyBase(Monty):
             if inputs_from_sms[i].use_state
         ]
         if len(combined_inputs) == 0:
-            # If we have no sensory input, we also don't use LM input
-            return None
+            if not self.allow_lm_inputs_without_sm:
+                # If we have no sensory input, we also don't use LM input.
+                return None
+            combined_lm_inputs = [
+                lm_input for lm_input in inputs_from_lms if lm_input.use_state
+            ]
+            return combined_lm_inputs if combined_lm_inputs else None
 
         for lm_input in inputs_from_lms:
             if lm_input.use_state:
@@ -351,12 +360,27 @@ class MontyBase(Monty):
     ###
 
     def load_state_dict(self, state_dict):
-        assert len(state_dict["lm_dict"]) == len(self.learning_modules)
-        lm_counter = 0
         lm_dict = state_dict["lm_dict"]
-        for lm_key in lm_dict.keys():
-            self.learning_modules[lm_counter].load_state_dict(lm_dict[lm_key])
-            lm_counter = lm_counter + 1
+        if len(lm_dict) != len(self.learning_modules):
+            if not self.allow_partial_lm_load:
+                raise AssertionError(
+                    "Checkpoint LM count does not match configured LM count "
+                    f"({len(lm_dict)} != {len(self.learning_modules)}). "
+                    "Set `allow_partial_lm_load=true` on the Monty config to "
+                    "load overlapping LMs only."
+                )
+            logger.warning(
+                "Partial LM load enabled: checkpoint has %d LMs, config has %d LMs; "
+                "loading first %d and leaving the rest initialized.",
+                len(lm_dict),
+                len(self.learning_modules),
+                min(len(lm_dict), len(self.learning_modules)),
+            )
+
+        for i, lm_key in enumerate(lm_dict.keys()):
+            if i >= len(self.learning_modules):
+                break
+            self.learning_modules[i].load_state_dict(lm_dict[lm_key])
 
     def state_dict(self):
         lm_dict = {

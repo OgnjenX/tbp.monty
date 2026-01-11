@@ -15,6 +15,7 @@ from tbp.monty.frameworks.models.hippocampal_graph_lm import (
     ReplayBatch,
 )
 from tbp.monty.frameworks.models.transition_consolidation_lm import (
+    CorticalTransitionLM,
     SequenceReplayMemory,
     TransitionConsolidationMemory,
 )
@@ -87,3 +88,25 @@ class TestSequenceReplayMemory:
         assert len(replays) == 2
         assert replays[0].observations[0].object_id == "A"
         assert replays[0].observations[1].object_id == "B"
+
+
+class _LMOutput:
+    def __init__(self, object_id: str, confidence: float):
+        self.use_state = True
+        self.non_morphological_features = {"object_id": object_id}
+        self.confidence = confidence
+
+
+class TestCorticalTransitionLM:
+    def test_updates_transitions_from_online_steps(self):
+        lm = CorticalTransitionLM(dedupe_consecutive_object_ids=True, learning_rate=0.5)
+        lm.pre_episode()
+        lm.matching_step([_LMOutput("A", 0.9)])
+        lm.matching_step([_LMOutput("A", 0.9)])
+        lm.matching_step([_LMOutput("B", 0.9)])
+        lm.post_episode()
+
+        # A->B should exist as a learned transition in the relational memory.
+        rel = lm.memory.relations.get(("A", "B"))
+        assert rel is not None
+        assert rel.transition_weight > 0.0
