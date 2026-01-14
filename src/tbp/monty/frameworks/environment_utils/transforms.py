@@ -524,6 +524,19 @@ class DepthTo3DLocations(Transform):
                 # normal extraction. View direction is the third column of the matrix.
                 observations[self.agent_id][sensor_id]["world_camera"] = world_camera
 
+                semantic_3d_frame = "world"
+            else:
+                semantic_3d_frame = "sensor"
+
+            # Deterministic metadata for downstream consumers. This indicates the
+            # reference frame of the 3D point coordinates in `semantic_3d`.
+            observations[self.agent_id][sensor_id]["semantic_3d_frame"] = (
+                semantic_3d_frame
+            )
+            observations[self.agent_id][sensor_id]["semantic_3d_in_world"] = (
+                semantic_3d_frame == "world"
+            )
+
             # Extract 3D coordinates of detected objects (semantic_id != 0)
             semantic = surface_patch.reshape(1, -1)
             if self.get_all_points:

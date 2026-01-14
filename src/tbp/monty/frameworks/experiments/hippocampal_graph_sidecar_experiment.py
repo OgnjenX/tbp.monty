@@ -22,6 +22,11 @@ from tbp.monty.frameworks.experiments.object_recognition_experiments import (
     MontyObjectRecognitionExperiment,
 )
 from tbp.monty.frameworks.models.abstract_monty_classes import LearningModule
+from tbp.monty.frameworks.models.entorhinal_interface import (
+    EntorhinalLocationIntegrator,
+    EntorhinalLocationIntegratorConfig,
+    observation_coordinate_frame,
+)
 from tbp.monty.frameworks.models.hippocampal_graph_lm import (
     HippocampalGraphLM,
     ObjectObservation,
@@ -64,6 +69,8 @@ class HippocampalGraphSidecarConfig:
     belief_entropy_max: float = 1.2
     belief_novelty_min: float = 0.15
     belief_min_objects: int = 2
+    enable_entorhinal_location_integration: bool = True
+    entorhinal_sensor_key_hint: Optional[str] = None
     write_csv: bool = True
 
 
@@ -98,6 +105,10 @@ class MontyObjectRecognitionHippocampalGraphSidecarExperiment(
         self._episode_observation_count: int = 0
         self._last_committed_cue: Optional[str] = None
         self._semantic_id_to_label: Optional[Dict[Any, str]] = None
+        self._last_env_observation: Any = None
+        self._last_agent_state: Any = None
+        self._last_observation_frame: Optional[str] = None
+        self._entorhinal: Optional[EntorhinalLocationIntegrator] = None
 
     def setup_experiment(self, config: Dict[str, Any]) -> None:
         super().setup_experiment(config)
@@ -110,6 +121,13 @@ class MontyObjectRecognitionHippocampalGraphSidecarExperiment(
             max_observations_per_episode=self._hipp_cfg.max_observations_per_episode,
             enable_replay=self._hipp_cfg.enable_replay,
             max_episode_history=self._hipp_cfg.max_episode_history,
+        )
+
+        self._entorhinal = EntorhinalLocationIntegrator(
+            EntorhinalLocationIntegratorConfig(
+                enabled=self._hipp_cfg.enable_entorhinal_location_integration,
+                sensor_key_hint=self._hipp_cfg.entorhinal_sensor_key_hint,
+            )
         )
 
         if self._hipp_cfg.enable_consolidation:
@@ -308,6 +326,7 @@ class MontyObjectRecognitionHippocampalGraphSidecarExperiment(
 
         loader_step = -1
         for loader_step, observation in enumerate(env_interface):
+            self._last_env_observation = observation
             if self._should_terminate_episode(loader_step):
                 return loader_step
 
@@ -341,6 +360,8 @@ class MontyObjectRecognitionHippocampalGraphSidecarExperiment(
     def _step_hippocampus(self, step: int) -> None:
         if self._hipp is None:
             return
+        self._last_agent_state = getattr(self.model, "get_agent_state", lambda: None)()
+        self._last_observation_frame = observation_coordinate_frame(self._last_env_observation)
         if self._hipp_cfg.enable_belief_encoding:
             self._observe_beliefs_from_lms(step_timestamp=float(step))
         else:
@@ -408,6 +429,7 @@ class MontyObjectRecognitionHippocampalGraphSidecarExperiment(
         location = np.asarray(location_raw, dtype=float)
         if np.size(location) == 0:
             return None
+        location = self._maybe_integrate_location(location)
 
         return {
             "object_id": object_id,
@@ -415,6 +437,24 @@ class MontyObjectRecognitionHippocampalGraphSidecarExperiment(
             "confidence": confidence,
             "source_lm": str(getattr(lm, "learning_module_id", "lm")),
         }
+
+    def _maybe_integrate_location(self, location: np.ndarray) -> np.ndarray:
+        """Optionally convert sensor-frame locations into a shared world frame.
+
+        This is a no-op when observations declare world coordinates (typical when
+        `world_coord=True` in the env observation processor). For safety, this also
+        no-ops when the reference frame is unknown/ambiguous.
+        """
+        if self._last_observation_frame != "sensor":
+            return location
+        if not self._hipp_cfg.enable_entorhinal_location_integration:
+            return location
+        if self._entorhinal is None or self._last_agent_state is None:
+            return location
+        return self._entorhinal.sensor_to_world(
+            location_sensor=location,
+            agent_state=self._last_agent_state,
+        )
 
     def _observe_beliefs_from_lms(self, step_timestamp: float) -> None:
         """Collect top-k hypotheses from votes and commit weighted co-activations."""
@@ -650,10 +690,11 @@ class MontyObjectRecognitionHippocampalGraphSidecarExperiment(
         best_state = max(states, key=lambda s: float(getattr(s, "confidence", 0.0)))
         conf = float(getattr(best_state, "confidence", 0.0))
         loc = np.asarray(getattr(best_state, "location", None), dtype=float)
-        
+
         if np.size(loc) == 0:
             return None
-        
+        loc = self._maybe_integrate_location(loc)
+
         obj_id = self._normalize_object_id(graph_id)
         return (obj_id, conf, loc)
 
