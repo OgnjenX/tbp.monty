@@ -10,7 +10,7 @@
 from __future__ import annotations
 
 import abc
-from typing import Dict, TypedDict
+from typing import Dict, TypedDict, Optional, Any
 
 import numpy as np
 import numpy.typing as npt
@@ -204,13 +204,23 @@ class LearningModule(metaclass=abc.ABCMeta):
     # Methods that define the algorithm
     ###
     @abc.abstractmethod
-    def matching_step(self):
-        """Matching / inference step called inside of monty._step_learning_modules."""
+    def matching_step(self, sensory_inputs: Optional[Any] = None) -> None:
+        """Matching / inference step called inside of monty._step_learning_modules.
+
+        Args:
+            sensory_inputs: Inputs collected for this LM for the current step. The exact
+                structure depends on the Monty variant (e.g., combined SM/LM inputs).
+        """
         pass
 
     @abc.abstractmethod
-    def exploratory_step(self):
-        """Model building step called inside of monty._step_learning_modules."""
+    def exploratory_step(self, sensory_inputs: Optional[Any] = None) -> None:
+        """Model building step called inside of monty._step_learning_modules.
+
+        Args:
+            sensory_inputs: Inputs collected for this LM for the current step. The exact
+                structure depends on the Monty variant (e.g., combined SM/LM inputs).
+        """
         pass
 
     @abc.abstractmethod

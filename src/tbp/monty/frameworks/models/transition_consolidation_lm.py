@@ -363,7 +363,7 @@ class CorticalTransitionLM(LearningModule):
     def set_experiment_mode(self, mode):
         self._experiment_mode = mode
 
-    def matching_step(self, sensory_inputs) -> None:
+    def matching_step(self, sensory_inputs=None) -> None:
         self._step_index += 1.0
         self._output = _OutputStub()
         self.buffer.set_last_obs_processed(False)
@@ -393,10 +393,14 @@ class CorticalTransitionLM(LearningModule):
 
         self.buffer.set_last_obs_processed(processed)
         if best_obj is not None:
-            self.observe_object_id(best_obj, location=best_loc, timestamp=self._step_index)
+            self.observe_object_id(
+                best_obj,
+                location=best_loc,
+                timestamp=self._step_index,
+            )
             self.buffer.increment_observations_on_object()
 
-    def exploratory_step(self, sensory_inputs) -> None:
+    def exploratory_step(self, sensory_inputs=None) -> None:
         return self.matching_step(sensory_inputs)
 
     def receive_votes(self, votes):

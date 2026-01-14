@@ -617,8 +617,11 @@ class GraphLM(LearningModule):
         self.detected_pose = [None for _ in range(7)]
         self.detected_rotation_r = None
 
-    def matching_step(self, observations):
+    def matching_step(self, sensory_inputs=None):
         """Update the possible matches given an observation."""
+        observations = sensory_inputs
+        if observations is None:
+            return
         first_movement_detected = self._agent_moved_since_reset()
         buffer_data = self._add_displacements(observations)
         self.buffer.append(buffer_data)
@@ -642,8 +645,11 @@ class GraphLM(LearningModule):
         stats = self.collect_stats_to_save()
         self.buffer.update_stats(stats, append=self.has_detailed_logger)
 
-    def exploratory_step(self, observations):
+    def exploratory_step(self, sensory_inputs=None):
         """Step without trying to recognize object (updating possible matches)."""
+        observations = sensory_inputs
+        if observations is None:
+            return
         buffer_data = self._add_displacements(observations)
         self.buffer.append(buffer_data)
         self.buffer.append_input_states(observations)
