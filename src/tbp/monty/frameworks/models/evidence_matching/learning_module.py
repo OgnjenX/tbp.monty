@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+import uuid
 
 import numpy as np
 import numpy.typing as npt
@@ -176,6 +177,7 @@ class EvidenceGraphLM(GraphLM):
         *args,
         **kwargs,
     ) -> None:
+        randomize_object_ids = kwargs.pop("randomize_object_ids", True)
         kwargs["initialize_base_modules"] = False
         super().__init__(*args, **kwargs)
         # --- LM components ---
@@ -212,6 +214,8 @@ class EvidenceGraphLM(GraphLM):
         self.max_graph_size = max_graph_size
         # --- Debugging Params ---
         self.use_multithreading = use_multithreading
+        # --- Object ID Params ---
+        self.randomize_object_ids = randomize_object_ids
 
         # TODO make sure we always extract pose features and remove this
         self.tolerances = add_pose_features_to_tolerances(tolerances)
@@ -495,7 +499,7 @@ class EvidenceGraphLM(GraphLM):
                 # to their memory.
                 graph_id = None
             else:
-                graph_id = "new_object" + str(len(self.graph_memory))
+                graph_id = self._create_new_object_id()
 
         elif terminal_state == "match":
             graph_id = self.get_possible_matches()[0]
@@ -513,6 +517,17 @@ class EvidenceGraphLM(GraphLM):
         else:
             graph_id = None
         self.detected_object = graph_id
+
+    def _create_new_object_id(self) -> str:
+        """Create a new object ID for a newly learned graph.
+
+        By default, this returns a randomly initialized ID to avoid relying on
+        string equality across LMs for voting.
+        """
+        if self.randomize_object_ids:
+            lm_id = getattr(self, "learning_module_id", "lm")
+            return f"{lm_id}_obj_{uuid.uuid4().hex[:10]}"
+        return "new_object" + str(len(self.graph_memory))
 
     def get_unique_pose_if_available(self, object_id):
         """Get the most likely pose of an object if narrowed down.
